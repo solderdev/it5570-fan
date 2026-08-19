@@ -117,6 +117,66 @@ echo 2 | sudo tee /sys/class/hwmon/hwmon*/pwm1_enable
 
 Install [coolercontrol](https://gitlab.com/coolercontrol/coolercontrol) and it will automatically detect the hwmon interface. You can then create custom fan curves using any of the 6 temperature sensors as input.
 
+## LattePanda Sigma port (work in progress)
+
+This fork targets the [LattePanda Sigma](https://docs.lattepanda.com/content/sigma_edition/EC_Firmware/) (Intel Core i5-1340P), which also uses an ITE IT5570 EC (`sensors-detect`: "Found unknown chip with ID 0x5570" at 0x4E) — but with **completely different EC firmware**, so the register map above does not apply.
+
+Findings (2026-08-19, against flashed EC firmware V1.02):
+
+- The Sigma's EC firmware (`LP-EC-WTADLC1R210-V1.02.bin`, "ITE EC-V14.6", "INTEL ADL P") is derived from Intel's **Alder Lake-P RVP reference EC firmware**, with DFRobot customizations.
+- The Sigma DSDT declares the EC device (`H_EC`, PNP0C09) but `_STA` returns Zero and all EC access methods are stubbed. Linux therefore never binds its ACPI EC driver (`ec_sys` exposes nothing) — raw port I/O at 0x62/0x66 is required, as this driver already does.
+- The DSDT stub retains ~20 register-name constants matching Intel's published [ADL RVP EC layout](https://github.com/slimbootloader/slimbootloader/blob/master/Platform/AlderlakeBoardPkg/AcpiTables/Dsdt/EC.ASL) — but live probing showed those offsets read as zero: DFRobot's firmware customization moved the ACPI window contents, so the RVP layout does **not** apply.
+
+### Sigma EC register map (ACPI EC space, verified live)
+
+Reads were confirmed by sampling all 256 EC bytes at 1 Hz through an idle → 8-core load → cooldown cycle and correlating against `coretemp` (Pearson r in parentheses); writes were confirmed by a live fan-control test.
+
+| Offset | R/W | Description |
+|---|---|---|
+| 0x2E/0x2F | R | CPU fan RPM, 16-bit **big-endian** (~1200 idle → ~3000 load); mirrored at 0x76/0x77 |
+| 0x70 | R | CPU temperature, °C (r=+0.94 vs coretemp) |
+| 0x96/0x97 | R | CPU temperature, 0.1 °C units, 16-bit **little-endian** (r=+0.95) |
+| 0x60 | R | Slow-moving temperature, °C — board temp candidate |
+| 0x23 | **R/W** | **Fan mode: 0 = off, 1 = manual, 2 = auto curve (default), 3 = full speed** |
+| 0x2D | **R/W** | **Manual duty in percent (0–100), applied when mode = 1. Defaults to 0** |
+| 0x28–0x2B | R/W | Auto-curve parameters: slope divisor, base duty %, low temp, high temp |
+
+Auto-curve defaults differ between EC firmware revisions (V1.02: 0x28=3, 0x29=40, 0x2A=30, 0x2B=80), so treat them as tunables rather than constants.
+
+### Fan control interface (recovered from firmware disassembly)
+
+The ACPI EC window maps to EC SRAM at **0x400** (EC offset `n` = SRAM `0x400+n`), confirmed because the firmware's `MOV DPTR,#0x04xx` sites line up exactly with the offsets found by live probing.
+
+The fan routine at file offset **0xA7AB** dispatches on EC offset 0x23:
+
+```asm
+0a7d6:  MOV DPTR,#0x0423   ; fan mode
+0a7d9:  MOVX A,@DPTR
+0a7da:  JNZ  0xa7e0        ; mode 0 -> duty register = 0
+0a7dc:  MOV DPTR,#0x1804   ; PWM duty hardware register
+0a7df:  MOVX @DPTR,A
+...
+0a7e4:  XRL  A,#0x01       ; mode 1 -> manual percent
+0a7e8:  MOV DPTR,#0x1841   ; PWM max/period value
+0a7ed:  MOV DPTR,#0x042d   ; duty percent from host
+0a7f0:  MOV R5,#0x64       ; scale = 100
+0a7f2:  LCALL 0xa8bb       ; [0x1804] = [0x042d] * [0x1841] / 100
+```
+
+Crucially, the firmware **only ever reads** offsets 0x23 and 0x2D — it never writes them. They are host-input fields, so this is an intended control path rather than a side effect.
+
+To control the fan: write the duty percent to **0x2D**, then write **1** to **0x23**. Write **2** to 0x23 to hand control back to the EC's automatic curve. Mode 3 forces 100 %.
+
+Write 0x2D **before** switching to mode 1. It defaults to 0, so entering manual mode first would briefly stop the fan.
+
+Fan RPM is computed by the firmware as **RPM = 2156250 / tach_counter** (routine at 0xA753, tach hardware register 0x181E/0x181F) and published to 0x2E/0x2F.
+
+### Verification results
+
+Live test on EC firmware V1.02: writing 0x2D=80 then 0x23=1 raised the fan from 1131 to 2481 RPM within 5 s and pulled the CPU from 51 °C to 45 °C. Restoring 0x23=2 returned control to the EC. RPM decays gradually rather than dropping instantly, matching the firmware's incremental ramp logic at 0xA880.
+
+Status: reads and fan control both verified live. Remaining work: adapt the driver's register constants and PWM scaling (EC uses 0–100 %, hwmon uses 0–255), and map `pwm1_enable` 1/2 to EC modes 1/2.
+
 ## Technical Background
 
 ### The ITE IT5570
