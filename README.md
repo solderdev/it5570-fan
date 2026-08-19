@@ -120,7 +120,7 @@ Manual mode (`pwm1_enable=1`) hands duty control to the host. Whether the EC fir
 
 The driver limits how bad a hung or crashed fan controller can get:
 - Manual duty is floored at 10 % (see "hwmon sysfs interface" below) — it can never command the fan fully off.
-- Fan control reverts to the EC's automatic curve when the module is unloaded and when the system suspends; on resume, the manual/full state active before suspend is re-applied.
+- Fan control reverts to the EC's automatic curve when the module is unloaded, when the system suspends, and on shutdown/reboot; on resume, the manual/full state active before suspend is re-applied.
 
 ### coolercontrol
 

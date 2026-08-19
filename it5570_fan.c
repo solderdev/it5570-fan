@@ -38,6 +38,7 @@
 #include <linux/jiffies.h>
 #include <linux/platform_device.h>
 #include <linux/dmi.h>
+#include <linux/pm.h>
 
 #define DRIVER_NAME	"it5570_fan"
 
@@ -520,6 +521,29 @@ static const struct hwmon_chip_info it5570_chip_info = {
 /*
  * Platform driver
  */
+/*
+ * devm-action counterpart of the old it5570_remove(): restores EC auto
+ * fan control. Registered on the platform device BEFORE the hwmon device
+ * is registered, so devres unwind order guarantees hwmon is torn down
+ * (sysfs writers can no longer re-enter manual mode) before this runs.
+ * No struct device * is available here, so log via pr_* rather than
+ * dev_*, matching the file's existing pr_* style.
+ */
+static void it5570_restore_auto_action(void *arg)
+{
+	struct it5570_data *data = arg;
+	int ret;
+
+	mutex_lock(&data->lock);
+	ret = it5570_set_mode(data, EC_FAN_MODE_AUTO);
+	mutex_unlock(&data->lock);
+	if (ret)
+		pr_warn(DRIVER_NAME ": failed to restore auto fan mode (%d)\n",
+			ret);
+	else
+		pr_info(DRIVER_NAME ": fan control restored to auto mode\n");
+}
+
 static int it5570_probe(struct platform_device *pdev)
 {
 	struct it5570_data *data;
@@ -531,6 +555,11 @@ static int it5570_probe(struct platform_device *pdev)
 		return -ENOMEM;
 
 	mutex_init(&data->lock);
+
+	ret = devm_add_action_or_reset(&pdev->dev, it5570_restore_auto_action,
+					data);
+	if (ret)
+		return ret;
 
 	hwmon_dev = devm_hwmon_device_register_with_info(
 		&pdev->dev, DRIVER_NAME, data,
@@ -553,20 +582,25 @@ static int it5570_probe(struct platform_device *pdev)
 	return 0;
 }
 
-static void it5570_remove(struct platform_device *pdev)
+/*
+ * A warm reboot does not reset the EC, so manual mode (and the last
+ * commanded duty) would otherwise survive into BIOS and the next boot
+ * with no host thermal management running. Force the EC back to its
+ * auto curve directly - cache state is meaningless once we're tearing
+ * down for reboot/poweroff, and a failure here must not abort shutdown.
+ */
+static void it5570_shutdown(struct platform_device *pdev)
 {
 	struct it5570_data *data = platform_get_drvdata(pdev);
 	int ret;
 
-	/* Restore EC auto fan control on unload */
 	mutex_lock(&data->lock);
-	ret = it5570_set_mode(data, EC_FAN_MODE_AUTO);
+	ret = ec_write_byte(EC_REG_FAN_MODE, EC_FAN_MODE_AUTO);
 	mutex_unlock(&data->lock);
 	if (ret)
 		dev_warn(&pdev->dev,
-			 "failed to restore auto fan mode (%d)\n", ret);
-	else
-		dev_info(&pdev->dev, "fan control restored to auto mode\n");
+			 "failed to restore auto fan mode on shutdown (%d)\n",
+			 ret);
 }
 
 static int it5570_suspend(struct device *dev)
@@ -620,7 +654,7 @@ static struct platform_driver it5570_driver = {
 		.pm = pm_sleep_ptr(&it5570_pm_ops),
 	},
 	.probe = it5570_probe,
-	.remove = it5570_remove,
+	.shutdown = it5570_shutdown,
 };
 
 /*
@@ -678,5 +712,5 @@ module_init(it5570_init);
 module_exit(it5570_exit);
 
 MODULE_AUTHOR("Michael");
-MODULE_DESCRIPTION("ITE IT5570 EC Fan Control Driver");
+MODULE_DESCRIPTION("LattePanda Sigma fan control driver (ITE IT5570 EC)");
 MODULE_LICENSE("GPL");
