@@ -124,11 +124,25 @@ static int ec_wait_obf_set(void)
 	return -ETIMEDOUT;
 }
 
+/*
+ * A previously timed-out transaction can leave a stale byte in OBF,
+ * which would be misattributed to the next read. Drain before starting
+ * any transaction. Caller must hold ec_io_mutex.
+ */
+static void ec_drain_obf(void)
+{
+	int i;
+
+	for (i = 0; i < 100 && (inb(EC_SC) & EC_SC_OBF); i++)
+		inb(EC_DATA);
+}
+
 static int ec_read_byte(u8 offset, u8 *val)
 {
 	int ret;
 
 	mutex_lock(&ec_io_mutex);
+	ec_drain_obf();
 
 	ret = ec_wait_ibf_clear();
 	if (ret)
@@ -155,6 +169,7 @@ static int ec_write_byte(u8 offset, u8 val)
 	int ret;
 
 	mutex_lock(&ec_io_mutex);
+	ec_drain_obf();
 
 	ret = ec_wait_ibf_clear();
 	if (ret)
