@@ -175,6 +175,8 @@ Fan RPM is computed by the firmware as **RPM = 2156250 / tach_counter** (routine
 
 Live test on EC firmware V1.02: writing 0x2D=80 then 0x23=1 raised the fan from 1131 to 2481 RPM within 5 s and pulled the CPU from 51 °C to 45 °C. Restoring 0x23=2 returned control to the EC. RPM decays gradually rather than dropping instantly, matching the firmware's incremental ramp logic at 0xA880.
 
+Mode 3 full-speed test (2026-08-19): at 50 °C baseline, writing 0x2D=50 then 0x23=3 raised the fan from ~1264 to ~3028 RPM within 5 s, well above the 2481 RPM observed at 80 % duty in manual mode. Restoring 0x23=2 returned control to the EC; RPM decayed to 3007, confirming expected firmware ramp-down. Mode 3 verified as full speed; `pwm1_enable=0` may safely map to mode 3.
+
 Status: reads and fan control both verified live. Remaining work: adapt the driver's register constants and PWM scaling (EC uses 0–100 %, hwmon uses 0–255), and map `pwm1_enable` 1/2 to EC modes 1/2.
 
 ## Technical Background
