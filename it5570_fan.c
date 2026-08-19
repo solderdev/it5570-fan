@@ -292,6 +292,69 @@ err:
 }
 
 /*
+ * Fan control helpers. All require data->lock held: the read-cache ->
+ * EC-write -> update-cache sequences below must not interleave between
+ * two writers, or a stale duty could land in the EC after a fresh one.
+ * Lock nesting is data->lock -> ec_io_mutex throughout the driver.
+ */
+
+/* Single enforcement point for the manual-duty safety floor. */
+static int it5570_write_duty(struct it5570_data *data, unsigned int percent)
+{
+	int ret;
+
+	percent = clamp_val(percent, EC_DUTY_MIN, EC_DUTY_MAX);
+	ret = ec_write_byte(EC_REG_FAN_DUTY, percent);
+	if (ret) {
+		data->valid = false;
+		return ret;
+	}
+	data->fan_duty = percent;
+	return 0;
+}
+
+/*
+ * The only path into manual mode. Duty is written before mode 1:
+ * 0x2D powers up at 0, so mode-first would stop the fan.
+ */
+static int it5570_set_manual(struct it5570_data *data, unsigned int percent)
+{
+	int ret;
+
+	ret = it5570_write_duty(data, percent);
+	if (ret)
+		return ret;	/* duty not set -> do not enter manual mode */
+
+	ret = ec_write_byte(EC_REG_FAN_MODE, EC_FAN_MODE_MANUAL);
+	if (ret) {
+		data->valid = false;	/* duty landed, mode unknown */
+		return ret;
+	}
+	data->fan_mode = EC_FAN_MODE_MANUAL;
+	return 0;
+}
+
+/*
+ * Direct mode setting for auto/full only. Manual goes through
+ * it5570_set_manual(); mode 0 (fan off) is never written, enforced here.
+ */
+static int it5570_set_mode(struct it5570_data *data, unsigned int mode)
+{
+	int ret;
+
+	if (mode != EC_FAN_MODE_AUTO && mode != EC_FAN_MODE_FULL)
+		return -EINVAL;
+
+	ret = ec_write_byte(EC_REG_FAN_MODE, mode);
+	if (ret) {
+		data->valid = false;
+		return ret;
+	}
+	data->fan_mode = mode;
+	return 0;
+}
+
+/*
  * hwmon interface
  */
 static umode_t it5570_is_visible(const void *drvdata,
@@ -391,8 +454,48 @@ static int it5570_read_string(struct device *dev, enum hwmon_sensor_types type,
 static int it5570_write(struct device *dev, enum hwmon_sensor_types type,
 			 u32 attr, int channel, long val)
 {
-	/* Transitional stub: write paths land in the next commit */
-	return -EOPNOTSUPP;
+	struct it5570_data *data = dev_get_drvdata(dev);
+	unsigned int duty;
+	int ret;
+
+	if (type != hwmon_pwm)
+		return -EOPNOTSUPP;
+
+	switch (attr) {
+	case hwmon_pwm_input:
+		/* Convert hwmon 0-255 to EC percent; never switches modes */
+		val = clamp_val(val, 0, HWMON_PWM_MAX);
+		val = DIV_ROUND_CLOSEST(val * EC_DUTY_MAX, HWMON_PWM_MAX);
+		mutex_lock(&data->lock);
+		ret = it5570_write_duty(data, val);
+		mutex_unlock(&data->lock);
+		return ret;
+
+	case hwmon_pwm_enable:
+		mutex_lock(&data->lock);
+		switch (val) {
+		case 0:	/* hwmon convention: full speed */
+			ret = it5570_set_mode(data, EC_FAN_MODE_FULL);
+			break;
+		case 1:	/* manual */
+			duty = data->fan_duty;
+			if (duty < EC_DUTY_MIN)
+				duty = EC_DUTY_DEFAULT;
+			ret = it5570_set_manual(data, duty);
+			break;
+		case 2:	/* EC auto curve */
+			ret = it5570_set_mode(data, EC_FAN_MODE_AUTO);
+			break;
+		default:
+			ret = -EINVAL;
+			break;
+		}
+		mutex_unlock(&data->lock);
+		return ret;
+
+	default:
+		return -EOPNOTSUPP;
+	}
 }
 
 static const struct hwmon_channel_info * const it5570_info[] = {
