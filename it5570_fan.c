@@ -31,6 +31,7 @@
 #include <linux/mutex.h>
 #include <linux/jiffies.h>
 #include <linux/platform_device.h>
+#include <linux/dmi.h>
 
 #define DRIVER_NAME	"it5570_fan"
 
@@ -579,9 +580,31 @@ static struct platform_driver it5570_driver = {
 	.remove = it5570_remove,
 };
 
+/*
+ * The IT5570 chip ID alone is not sufficient identification: the upstream
+ * AMD mini-PC boards carry the same EC with entirely different firmware
+ * register assignments (their fan-RPM low byte is our mode register).
+ * This driver's register map is Sigma-only, so refuse anything else.
+ */
+static const struct dmi_system_id it5570_dmi_table[] = {
+	{
+		.matches = {
+			DMI_MATCH(DMI_SYS_VENDOR, "LattePanda"),
+			DMI_MATCH(DMI_PRODUCT_NAME, "LattePanda Sigma"),
+		},
+	},
+	{ }
+};
+MODULE_DEVICE_TABLE(dmi, it5570_dmi_table);
+
 static int __init it5570_init(void)
 {
 	int ret;
+
+	if (!dmi_check_system(it5570_dmi_table)) {
+		pr_info(DRIVER_NAME ": not a LattePanda Sigma, aborting\n");
+		return -ENODEV;
+	}
 
 	ret = it5570_detect();
 	if (ret)
