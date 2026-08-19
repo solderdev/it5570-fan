@@ -555,16 +555,69 @@ static int it5570_probe(struct platform_device *pdev)
 
 static void it5570_remove(struct platform_device *pdev)
 {
+	struct it5570_data *data = platform_get_drvdata(pdev);
+	int ret;
+
 	/* Restore EC auto fan control on unload */
-	if (ec_write_byte(EC_REG_FAN_MODE, EC_FAN_MODE_AUTO))
-		dev_warn(&pdev->dev, "failed to restore auto fan mode\n");
+	mutex_lock(&data->lock);
+	ret = it5570_set_mode(data, EC_FAN_MODE_AUTO);
+	mutex_unlock(&data->lock);
+	if (ret)
+		dev_warn(&pdev->dev,
+			 "failed to restore auto fan mode (%d)\n", ret);
 	else
 		dev_info(&pdev->dev, "fan control restored to auto mode\n");
 }
 
+static int it5570_suspend(struct device *dev)
+{
+	struct it5570_data *data = dev_get_drvdata(dev);
+	int ret;
+
+	mutex_lock(&data->lock);
+	/*
+	 * Hand the fan to the EC auto curve for the transition. Written
+	 * directly (not via it5570_set_mode) so the cached fan_mode and
+	 * fan_duty survive for resume to re-apply.
+	 */
+	ret = ec_write_byte(EC_REG_FAN_MODE, EC_FAN_MODE_AUTO);
+	mutex_unlock(&data->lock);
+	if (ret)
+		dev_warn(dev, "failed to set auto fan mode on suspend (%d)\n",
+			 ret);
+	/*
+	 * Deliberate exception to the "failed write invalidates the cache"
+	 * rule: a failed write here means the EC still matches the cache,
+	 * and resume invalidates unconditionally anyway.
+	 */
+	return 0;	/* never abort system suspend over an EC timeout */
+}
+
+static int it5570_resume(struct device *dev)
+{
+	struct it5570_data *data = dev_get_drvdata(dev);
+	int ret = 0;
+
+	mutex_lock(&data->lock);
+	if (data->fan_mode == EC_FAN_MODE_MANUAL)
+		ret = it5570_set_manual(data, data->fan_duty);
+	else if (data->fan_mode == EC_FAN_MODE_FULL)
+		ret = it5570_set_mode(data, EC_FAN_MODE_FULL);
+	/* jiffies froze across suspend; force a fresh read next access */
+	data->valid = false;
+	mutex_unlock(&data->lock);
+	if (ret)
+		dev_warn(dev, "failed to restore fan state on resume (%d)\n",
+			 ret);
+	return 0;
+}
+
+static DEFINE_SIMPLE_DEV_PM_OPS(it5570_pm_ops, it5570_suspend, it5570_resume);
+
 static struct platform_driver it5570_driver = {
 	.driver = {
 		.name = DRIVER_NAME,
+		.pm = pm_sleep_ptr(&it5570_pm_ops),
 	},
 	.probe = it5570_probe,
 	.remove = it5570_remove,
