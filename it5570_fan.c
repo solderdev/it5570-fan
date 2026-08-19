@@ -1,25 +1,31 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * ITE IT5570 EC Fan Control Driver
+ * LattePanda Sigma fan control driver (ITE IT5570 EC)
  *
- * Provides hwmon interface for fan control on systems with an ITE IT5570
- * embedded controller. Controls the fan via the ACPI EC register interface.
+ * hwmon interface for the DFRobot LattePanda Sigma's EC fan control.
+ * Sigma-only: the same IT5570 chip ID appears on unrelated boards
+ * (including the upstream AMD mini-PCs this driver was forked from)
+ * with entirely different firmware register assignments, so the probe
+ * is gated on DMI. The Intel ADL RVP reference layout also does not
+ * apply to this firmware.
  *
- * EC Register Map (ACPI EC offsets):
- *   0x0E - Fan duty status (read-only, 0-100%)
- *   0x0F - Fan duty control (write 1-100 for manual %, 0 for auto)
- *   0x22 - Fan RPM high byte
- *   0x23 - Fan RPM low byte
- *   0x26 - CPU temperature (°C, filtered)
- *   0xF1 - Board temperature (°C)
+ * EC register map (ACPI EC offsets; the window maps to EC SRAM 0x400+n).
+ * Verified by live probing and firmware disassembly — see README
+ * "LattePanda Sigma port":
+ *   0x23 - fan mode: 0 off, 1 manual, 2 auto curve (default), 3 full
+ *   0x2D - manual duty percent 0-100, applied only in mode 1
+ *   0x2E - fan RPM high byte (big-endian pair)
+ *   0x2F - fan RPM low byte
+ *   0x70 - CPU temperature (°C)
  *
- * EC SRAM addresses (via SIO indirect access at 0x4E/0x4F):
- *   0x05B9 - CPU die temperature (°C, raw/unfiltered, faster response)
- *   0x0C44 - Heatsink temperature (°C)
- *   0x0C4A - Chipset temperature (°C)
- *   0x086A - EC internal temperature (°C)
+ * Write ordering is safety-critical: 0x2D powers up at 0, so duty must
+ * be written before mode 1 or the fan would stop on manual-mode entry.
  *
- * The EC is accessed at Super I/O port 0x4E, chip ID 0x5570.
+ * pwm1 reports the last commanded manual duty; the EC exposes no
+ * readback of the auto curve's live output.
+ *
+ * The ACPI DSDT declares the EC device with _STA=0, so the kernel's
+ * ACPI EC driver never binds and raw port I/O on 0x62/0x66 is safe.
  */
 
 #include <linux/module.h>
@@ -54,23 +60,24 @@
 #define EC_CMD_READ	0x80
 #define EC_CMD_WRITE	0x81
 
-/* EC register offsets (ACPI EC address space) */
-#define EC_REG_FAN_DUTY_STATUS	0x0E	/* Current duty, read-only */
-#define EC_REG_FAN_DUTY_CTRL	0x0F	/* Duty control: 0=auto, 1-100=manual */
-#define EC_REG_FAN_RPM_HI	0x22
-#define EC_REG_FAN_RPM_LO	0x23
-#define EC_REG_CPU_TEMP		0x26
-#define EC_REG_BOARD_TEMP	0xF1
+/* EC register offsets (ACPI EC address space = EC SRAM 0x400 + n) */
+#define EC_REG_FAN_MODE		0x23	/* 0 off, 1 manual, 2 auto, 3 full */
+#define EC_REG_FAN_DUTY		0x2D	/* manual duty %, applied in mode 1 only */
+#define EC_REG_FAN_RPM_HI	0x2E	/* big-endian pair */
+#define EC_REG_FAN_RPM_LO	0x2F
+#define EC_REG_CPU_TEMP		0x70	/* °C */
 
-/* EC SRAM addresses (accessed via SIO indirect interface) */
-#define SRAM_CPU_DIE_TEMP	0x05B9	/* Raw/unfiltered CPU die temp */
-#define SRAM_HEATSINK_TEMP	0x0C44	/* Heatsink temperature */
-#define SRAM_CHIPSET_TEMP	0x0C4A	/* Chipset temperature */
-#define SRAM_EC_TEMP		0x086A	/* EC internal temperature */
+/* Fan mode register values */
+#define EC_FAN_MODE_OFF		0	/* comparison only — NEVER written */
+#define EC_FAN_MODE_MANUAL	1
+#define EC_FAN_MODE_AUTO	2
+#define EC_FAN_MODE_FULL	3
 
-/* PWM conversion: hwmon uses 0-255, EC uses 0-100 */
-#define EC_DUTY_MAX	100
-#define HWMON_PWM_MAX	255
+/* PWM conversion: hwmon uses 0-255, EC uses percent */
+#define EC_DUTY_MIN		10	/* safety floor for manual duty */
+#define EC_DUTY_MAX		100
+#define EC_DUTY_DEFAULT		50	/* used when no sane cached duty exists */
+#define HWMON_PWM_MAX		255
 
 struct it5570_data {
 	struct mutex lock;
@@ -79,14 +86,9 @@ struct it5570_data {
 
 	/* Cached sensor values */
 	unsigned int fan_rpm;
-	unsigned int fan_duty;	/* 0-100 from EC */
-	unsigned int cpu_temp;
-	unsigned int board_temp;
-	unsigned int cpu_die_temp;	/* Raw/unfiltered, from SRAM */
-	unsigned int heatsink_temp;	/* From SRAM */
-	unsigned int chipset_temp;	/* From SRAM */
-	unsigned int ec_temp;		/* From SRAM */
-	unsigned int fan_ctrl;	/* current control register value */
+	unsigned int fan_duty;	/* 0-100, cached 0x2D */
+	unsigned int fan_mode;	/* cached 0x23 */
+	unsigned int cpu_temp;	/* °C */
 };
 
 static struct platform_device *it5570_pdev;
@@ -192,40 +194,6 @@ out:
 }
 
 /*
- * SIO indirect SRAM access
- *
- * The IT5570 SMFI (Shared Memory Flash Interface) provides indirect
- * access to the EC's full SRAM space via SIO config registers 0x2E/0x2F.
- * Sub-register 0x11 sets the address high byte, 0x10 the low byte,
- * and 0x12 transfers the data byte.
- */
-static int sio_sram_read(u16 addr, u8 *val)
-{
-	mutex_lock(&ec_io_mutex);
-
-	/* Address high byte */
-	outb(0x2E, SIO_PORT);
-	outb(0x11, SIO_DATA);
-	outb(0x2F, SIO_PORT);
-	outb((addr >> 8) & 0xFF, SIO_DATA);
-
-	/* Address low byte */
-	outb(0x2E, SIO_PORT);
-	outb(0x10, SIO_DATA);
-	outb(0x2F, SIO_PORT);
-	outb(addr & 0xFF, SIO_DATA);
-
-	/* Read data */
-	outb(0x2E, SIO_PORT);
-	outb(0x12, SIO_DATA);
-	outb(0x2F, SIO_PORT);
-	*val = inb(SIO_DATA);
-
-	mutex_unlock(&ec_io_mutex);
-	return 0;
-}
-
-/*
  * Super I/O chip detection
  */
 static void sio_enter(void)
@@ -275,7 +243,7 @@ static int it5570_detect(void)
  */
 static int it5570_update(struct it5570_data *data)
 {
-	u8 hi, lo, val;
+	u8 hi, lo, duty, mode, temp;
 	int ret;
 
 	mutex_lock(&data->lock);
@@ -289,47 +257,26 @@ static int it5570_update(struct it5570_data *data)
 	ret = ec_read_byte(EC_REG_FAN_RPM_LO, &lo);
 	if (ret)
 		goto err;
+	ret = ec_read_byte(EC_REG_FAN_DUTY, &duty);
+	if (ret)
+		goto err;
+	ret = ec_read_byte(EC_REG_FAN_MODE, &mode);
+	if (ret)
+		goto err;
+	ret = ec_read_byte(EC_REG_CPU_TEMP, &temp);
+	if (ret)
+		goto err;
+
 	data->fan_rpm = (hi << 8) | lo;
+	if (data->fan_rpm == 0xFFFF)
+		data->fan_rpm = 0;	/* saturated tach: stopped/unplugged */
+	data->fan_duty = duty;
+	data->fan_mode = mode;
+	data->cpu_temp = temp;
 
-	ret = ec_read_byte(EC_REG_FAN_DUTY_STATUS, &val);
-	if (ret)
-		goto err;
-	data->fan_duty = val;
-
-	ret = ec_read_byte(EC_REG_FAN_DUTY_CTRL, &val);
-	if (ret)
-		goto err;
-	data->fan_ctrl = val;
-
-	ret = ec_read_byte(EC_REG_CPU_TEMP, &val);
-	if (ret)
-		goto err;
-	data->cpu_temp = val;
-
-	ret = ec_read_byte(EC_REG_BOARD_TEMP, &val);
-	if (ret)
-		goto err;
-	data->board_temp = val;
-
-	ret = sio_sram_read(SRAM_CPU_DIE_TEMP, &val);
-	if (ret)
-		goto err;
-	data->cpu_die_temp = val;
-
-	ret = sio_sram_read(SRAM_HEATSINK_TEMP, &val);
-	if (ret)
-		goto err;
-	data->heatsink_temp = val;
-
-	ret = sio_sram_read(SRAM_CHIPSET_TEMP, &val);
-	if (ret)
-		goto err;
-	data->chipset_temp = val;
-
-	ret = sio_sram_read(SRAM_EC_TEMP, &val);
-	if (ret)
-		goto err;
-	data->ec_temp = val;
+	if (mode < EC_FAN_MODE_MANUAL || mode > EC_FAN_MODE_FULL)
+		pr_warn_ratelimited(DRIVER_NAME ": unexpected fan mode %u\n",
+				    mode);
 
 	data->last_updated = jiffies;
 	data->valid = true;
@@ -339,6 +286,7 @@ out:
 	return 0;
 
 err:
+	data->valid = false;
 	mutex_unlock(&data->lock);
 	return ret;
 }
@@ -392,13 +340,29 @@ static int it5570_read(struct device *dev, enum hwmon_sensor_types type,
 	case hwmon_pwm:
 		switch (attr) {
 		case hwmon_pwm_input:
-			/* Convert EC duty 0-100 to hwmon 0-255 */
-			*val = DIV_ROUND_CLOSEST(data->fan_duty * HWMON_PWM_MAX,
-						 EC_DUTY_MAX);
+			if (data->fan_mode == EC_FAN_MODE_FULL)
+				*val = HWMON_PWM_MAX;
+			else if (data->fan_mode == EC_FAN_MODE_OFF)
+				*val = 0;	/* stopped fan must not report a speed */
+			else
+				/* min() guards a corrupt >100 duty in 0x2D */
+				*val = min(DIV_ROUND_CLOSEST(data->fan_duty *
+							     HWMON_PWM_MAX,
+							     EC_DUTY_MAX),
+					   (unsigned int)HWMON_PWM_MAX);
 			return 0;
 		case hwmon_pwm_enable:
-			/* 0 = auto (EC control), 1 = manual */
-			*val = data->fan_ctrl ? 1 : 2;
+			switch (data->fan_mode) {
+			case EC_FAN_MODE_AUTO:
+				*val = 2;
+				break;
+			case EC_FAN_MODE_FULL:
+				*val = 0;
+				break;
+			default:
+				*val = 1;
+				break;
+			}
 			return 0;
 		default:
 			return -EOPNOTSUPP;
@@ -406,28 +370,8 @@ static int it5570_read(struct device *dev, enum hwmon_sensor_types type,
 
 	case hwmon_temp:
 		/* hwmon temperatures are in millidegrees C */
-		switch (channel) {
-		case 0:
-			*val = data->cpu_temp * 1000;
-			return 0;
-		case 1:
-			*val = data->board_temp * 1000;
-			return 0;
-		case 2:
-			*val = data->cpu_die_temp * 1000;
-			return 0;
-		case 3:
-			*val = data->heatsink_temp * 1000;
-			return 0;
-		case 4:
-			*val = data->chipset_temp * 1000;
-			return 0;
-		case 5:
-			*val = data->ec_temp * 1000;
-			return 0;
-		default:
-			return -EOPNOTSUPP;
-		}
+		*val = data->cpu_temp * 1000;
+		return 0;
 
 	default:
 		return -EOPNOTSUPP;
@@ -437,18 +381,8 @@ static int it5570_read(struct device *dev, enum hwmon_sensor_types type,
 static int it5570_read_string(struct device *dev, enum hwmon_sensor_types type,
 			      u32 attr, int channel, const char **str)
 {
-	static const char * const temp_labels[] = {
-		"CPU",
-		"Board",
-		"CPU Die",
-		"Heatsink",
-		"Chipset",
-		"EC",
-	};
-
-	if (type == hwmon_temp && attr == hwmon_temp_label &&
-	    channel < ARRAY_SIZE(temp_labels)) {
-		*str = temp_labels[channel];
+	if (type == hwmon_temp && attr == hwmon_temp_label && channel == 0) {
+		*str = "CPU";
 		return 0;
 	}
 	return -EOPNOTSUPP;
@@ -457,80 +391,14 @@ static int it5570_read_string(struct device *dev, enum hwmon_sensor_types type,
 static int it5570_write(struct device *dev, enum hwmon_sensor_types type,
 			 u32 attr, int channel, long val)
 {
-	struct it5570_data *data = dev_get_drvdata(dev);
-	int ret;
-
-	switch (type) {
-	case hwmon_pwm:
-		switch (attr) {
-		case hwmon_pwm_input:
-			/* Convert hwmon 0-255 to EC duty 0-100 */
-			val = clamp_val(val, 0, HWMON_PWM_MAX);
-			val = DIV_ROUND_CLOSEST(val * EC_DUTY_MAX,
-						HWMON_PWM_MAX);
-			if (val == 0)
-				val = 1; /* Minimum 1% when manually set */
-			ret = ec_write_byte(EC_REG_FAN_DUTY_CTRL, val);
-			if (!ret) {
-				mutex_lock(&data->lock);
-				data->fan_ctrl = val;
-				data->fan_duty = val;
-				data->valid = false;
-				mutex_unlock(&data->lock);
-			}
-			return ret;
-
-		case hwmon_pwm_enable:
-			if (val == 2 || val == 0) {
-				/* Auto mode: write 0 to control register */
-				ret = ec_write_byte(EC_REG_FAN_DUTY_CTRL, 0);
-				if (!ret) {
-					mutex_lock(&data->lock);
-					data->fan_ctrl = 0;
-					data->valid = false;
-					mutex_unlock(&data->lock);
-				}
-				return ret;
-			} else if (val == 1) {
-				/*
-				 * Manual mode: read current duty and write it
-				 * to lock the current speed
-				 */
-				mutex_lock(&data->lock);
-				val = data->fan_duty;
-				if (val == 0)
-					val = 50; /* Default to 50% */
-				mutex_unlock(&data->lock);
-				ret = ec_write_byte(EC_REG_FAN_DUTY_CTRL, val);
-				if (!ret) {
-					mutex_lock(&data->lock);
-					data->fan_ctrl = val;
-					data->valid = false;
-					mutex_unlock(&data->lock);
-				}
-				return ret;
-			}
-			return -EINVAL;
-
-		default:
-			return -EOPNOTSUPP;
-		}
-
-	default:
-		return -EOPNOTSUPP;
-	}
+	/* Transitional stub: write paths land in the next commit */
+	return -EOPNOTSUPP;
 }
 
 static const struct hwmon_channel_info * const it5570_info[] = {
 	HWMON_CHANNEL_INFO(fan, HWMON_F_INPUT),
 	HWMON_CHANNEL_INFO(pwm, HWMON_PWM_INPUT | HWMON_PWM_ENABLE),
-	HWMON_CHANNEL_INFO(temp,
-		HWMON_T_INPUT | HWMON_T_LABEL,
-		HWMON_T_INPUT | HWMON_T_LABEL,
-		HWMON_T_INPUT | HWMON_T_LABEL,
-		HWMON_T_INPUT | HWMON_T_LABEL,
-		HWMON_T_INPUT | HWMON_T_LABEL,
-		HWMON_T_INPUT | HWMON_T_LABEL),
+	HWMON_CHANNEL_INFO(temp, HWMON_T_INPUT | HWMON_T_LABEL),
 	NULL
 };
 
@@ -553,6 +421,7 @@ static int it5570_probe(struct platform_device *pdev)
 {
 	struct it5570_data *data;
 	struct device *hwmon_dev;
+	int ret;
 
 	data = devm_kzalloc(&pdev->dev, sizeof(*data), GFP_KERNEL);
 	if (!data)
@@ -569,22 +438,25 @@ static int it5570_probe(struct platform_device *pdev)
 	platform_set_drvdata(pdev, data);
 
 	/* Initial read */
-	it5570_update(data);
-
-	dev_info(&pdev->dev,
-		 "CPU: %u°C, Die: %u°C, Board: %u°C, Heatsink: %u°C, Chipset: %u°C, EC: %u°C, Fan: %u RPM (%u%% duty)\n",
-		 data->cpu_temp, data->cpu_die_temp, data->board_temp,
-		 data->heatsink_temp, data->chipset_temp, data->ec_temp,
-		 data->fan_rpm, data->fan_duty);
+	ret = it5570_update(data);
+	if (ret)
+		dev_warn(&pdev->dev, "initial EC read failed (%d)\n", ret);
+	else
+		dev_info(&pdev->dev,
+			 "CPU: %u°C, fan: %u RPM (%u%% duty, mode %u)\n",
+			 data->cpu_temp, data->fan_rpm, data->fan_duty,
+			 data->fan_mode);
 
 	return 0;
 }
 
 static void it5570_remove(struct platform_device *pdev)
 {
-	/* Restore auto fan control on unload */
-	ec_write_byte(EC_REG_FAN_DUTY_CTRL, 0);
-	dev_info(&pdev->dev, "fan control restored to auto mode\n");
+	/* Restore EC auto fan control on unload */
+	if (ec_write_byte(EC_REG_FAN_MODE, EC_FAN_MODE_AUTO))
+		dev_warn(&pdev->dev, "failed to restore auto fan mode\n");
+	else
+		dev_info(&pdev->dev, "fan control restored to auto mode\n");
 }
 
 static struct platform_driver it5570_driver = {
