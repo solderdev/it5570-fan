@@ -19,7 +19,7 @@ Found unknown chip with ID 0x5570
 
 The Lattepanda Sigma EC firmware binary blob is stored in ../ec_firmware directory.
 The verified register map and fan control interface are documented in README.md
-("LattePanda Sigma port"): read RPM at 0x2E/0x2F (big-endian) and CPU temp at 0x70;
+("Reverse engineering the Sigma EC"): read RPM at 0x2E/0x2F (big-endian) and CPU temp at 0x70;
 control the fan via mode register 0x23 (1 = manual) plus duty percent at 0x2D.
 The ACPI EC window maps to EC SRAM base 0x400.
 The Sigma DSDT disables the ACPI EC device (_STA=0), so all access is raw port I/O.

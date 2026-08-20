@@ -15,7 +15,7 @@ This fork is **LattePanda Sigma-only**: the probe is gated on a DMI match (`Latt
 
 ### sensors output
 
-Real capture from the live driver test (2026-08-20, kernel 6.12.103, EC auto mode at idle):
+Live capture on a LattePanda Sigma, EC auto mode at idle:
 
 ```
 it5570_fan-isa-0000
@@ -54,7 +54,7 @@ You may also have found this page by searching for:
 
 | Device | APU | EC firmware | Status |
 |---|---|---|---|
-| LattePanda Sigma | Intel Core i5-1340P (Alder Lake-P) | ITE EC-V14.6, `LP-EC-WTADLC1R210-V1.02` | Driver tested live end-to-end (2026-08-20, kernel 6.12.103): load, manual duty, 10 % floor clamp, full speed, auto restore, unload, suspend/resume — see "Verification results" |
+| LattePanda Sigma | Intel Core i5-1340P (Alder Lake-P) | ITE EC-V14.6, `LP-EC-WTADLC1R210-V1.02` | Tested live end-to-end on kernel 6.12: load, manual duty, 10 % floor clamp, full speed, auto restore, unload, suspend/resume — see [Verification results](#verification-results) |
 
 *Supported by the upstream project, not this fork:* the AMD Phoenix/Hawk Point white-label mini PCs (AceMagic, Beelink, MinisForum, etc.) that the original project targets also carry an ITE IT5570 EC, but with a completely different register layout. This fork's DMI gate refuses to bind on that hardware; use the [upstream project](https://github.com/passiveEndeavour/it5570-fan) there instead.
 
@@ -117,11 +117,9 @@ The driver limits how bad a hung or crashed fan controller can get:
 
 Install [coolercontrol](https://gitlab.com/coolercontrol/coolercontrol) and it will automatically detect the hwmon interface. You can then create a custom fan curve using the CPU temperature sensor as input.
 
-## LattePanda Sigma port
+## Reverse engineering the Sigma EC
 
-This fork targets the [LattePanda Sigma](https://docs.lattepanda.com/content/sigma_edition/EC_Firmware/) (Intel Core i5-1340P), which also uses an ITE IT5570 EC (`sensors-detect`: "Found unknown chip with ID 0x5570" at 0x4E) — but with **completely different EC firmware**, so the register map above does not apply.
-
-Findings (2026-08-19, against flashed EC firmware V1.02):
+The [LattePanda Sigma](https://docs.lattepanda.com/content/sigma_edition/EC_Firmware/) (Intel Core i5-1340P) uses an ITE IT5570 EC (`sensors-detect`: "Found unknown chip with ID 0x5570" at 0x4E) with **completely different firmware** from the AMD mini PCs the upstream project targets, so its register map had to be recovered from scratch. This section documents how, against flashed EC firmware V1.02:
 
 - The Sigma's EC firmware (`LP-EC-WTADLC1R210-V1.02.bin`, "ITE EC-V14.6", "INTEL ADL P") is derived from Intel's **Alder Lake-P RVP reference EC firmware**, with DFRobot customizations.
 - The Sigma DSDT declares the EC device (`H_EC`, PNP0C09) but `_STA` returns Zero and all EC access methods are stubbed. Linux therefore never binds its ACPI EC driver (`ec_sys` exposes nothing) — raw port I/O at 0x62/0x66 is required, as this driver already does.
@@ -175,13 +173,13 @@ Fan RPM is computed by the firmware as **RPM = 2156250 / tach_counter** (routine
 
 Live test on EC firmware V1.02: writing 0x2D=80 then 0x23=1 raised the fan from 1131 to 2481 RPM within 5 s and pulled the CPU from 51 °C to 45 °C. Restoring 0x23=2 returned control to the EC. RPM decays gradually rather than dropping instantly, matching the firmware's incremental ramp logic at 0xA880.
 
-Mode 3 full-speed test (2026-08-19): at 50 °C baseline, writing 0x2D=50 then 0x23=3 raised the fan from ~1264 to ~3028 RPM within 5 s, well above the 2481 RPM observed at 80 % duty in manual mode. Restoring 0x23=2 returned control to the EC; RPM decayed to 3007, confirming expected firmware ramp-down. Mode 3 verified as full speed; `pwm1_enable=0` may safely map to mode 3.
+Mode 3 full-speed test: at 50 °C baseline, writing 0x2D=50 then 0x23=3 raised the fan from ~1264 to ~3028 RPM within 5 s, well above the 2481 RPM observed at 80 % duty in manual mode. Restoring 0x23=2 returned control to the EC; RPM decayed to 3007, confirming expected firmware ramp-down. Mode 3 verified as full speed; `pwm1_enable=0` may safely map to mode 3.
 
-Live driver test (2026-08-20, kernel 6.12.103-1-MANJARO): the compiled module was loaded and exercised end-to-end through sysfs. Probe reported CPU 50 °C, 2867 RPM, mode 2, and all reads tracked the EC (temp1_input in m°C, `temp1_label` = CPU, `pwm1_enable` = 2). Manual mode at `pwm1`=204 (80 %) reached 2487 RPM, matching the 2481 RPM raw-port result. Writing `pwm1`=0 clamped to the 10 % floor (readback 26) with the fan stable and spinning at ~209 RPM. `pwm1_enable`=0 (EC mode 3) reached 3028 RPM with `pwm1` reading 255; `pwm1_enable`=2 handed control back to the auto curve with the usual gradual ramp-down, and `rmmod` logged "fan control restored to auto mode".
+Full driver test (kernel 6.12, Manjaro): the compiled module was loaded and exercised end-to-end through sysfs. Probe reported CPU 50 °C, 2867 RPM, mode 2, and all reads tracked the EC (temp1_input in m°C, `temp1_label` = CPU, `pwm1_enable` = 2). Manual mode at `pwm1`=204 (80 %) reached 2487 RPM, matching the 2481 RPM raw-port result. Writing `pwm1`=0 clamped to the 10 % floor (readback 26) with the fan stable and spinning at ~209 RPM. `pwm1_enable`=0 (EC mode 3) reached 3028 RPM with `pwm1` reading 255; `pwm1_enable`=2 handed control back to the auto curve with the usual gradual ramp-down, and `rmmod` logged "fan control restored to auto mode".
 
-Suspend/resume test (2026-08-20): with manual mode at 80 % active, the system entered S3 and the resume hook re-applied the manual state — `pwm1`=204, `pwm1_enable`=1, fan back at 2478 RPM — with no driver warnings in the log. One platform caveat, unrelated to this driver: the Sigma wakes from S3 immediately (asleep for under a second, ACPI GPE 6D / PME_B0 firing with an xHCI "xHC error in resume, USBSTS 0x401" on every cycle). A control suspend with the module unloaded reproduced the instant wake exactly, so suspend-hold time is a firmware/USB issue, not an EC or driver one.
+Suspend/resume test: with manual mode at 80 % active, the system entered S3 and the resume hook re-applied the manual state — `pwm1`=204, `pwm1_enable`=1, fan back at 2478 RPM — with no driver warnings in the log. One platform caveat, unrelated to this driver: the Sigma wakes from S3 immediately (asleep for under a second, ACPI GPE 6D / PME_B0 firing with an xHCI "xHC error in resume, USBSTS 0x401" on every cycle). A control suspend with the module unloaded reproduced the instant wake exactly, so suspend-hold time is a firmware/USB issue, not an EC or driver one.
 
-Status: reads and fan control verified live, and the driver has since been adapted to this register map — register constants, PWM scaling (EC 0–100 % ↔ hwmon 0–255), and `pwm1_enable` mode mapping (0/1/2 → EC modes 3/1/2) are implemented and documented in `it5570_fan.c` and in "hwmon sysfs interface" below. The full live driver test, including suspend/resume, has passed.
+Everything above is implemented in the driver: register constants, PWM scaling (EC 0–100 % ↔ hwmon 0–255), and the `pwm1_enable` mode mapping (0/1/2 → EC modes 3/1/2) — see `it5570_fan.c` and ["hwmon sysfs interface"](#hwmon-sysfs-interface) below.
 
 ## Technical Background
 
@@ -197,7 +195,7 @@ The driver talks to the EC entirely through the ACPI EC ports (0x62/0x66), using
 
 ### EC register map
 
-This is the map the driver actually uses. It was recovered by live probing and firmware disassembly against the Sigma's EC firmware — see ["LattePanda Sigma port"](#lattepanda-sigma-port) above for the full register table, the disassembly, and how each field was verified.
+This is the map the driver actually uses. It was recovered by live probing and firmware disassembly against the Sigma's EC firmware — see ["Reverse engineering the Sigma EC"](#reverse-engineering-the-sigma-ec) above for the full register table, the disassembly, and how each field was verified.
 
 | Offset | R/W | Description |
 |---|---|---|
@@ -208,7 +206,7 @@ This is the map the driver actually uses. It was recovered by live probing and f
 
 ### Reverse engineering methodology (original AMD hardware)
 
-This section describes how the upstream project found *its* register map — it does not apply to the Sigma map above, which was found by a different process (firmware disassembly and live correlation against `coretemp`; see "LattePanda Sigma port"). Kept here as background on the original AMD-based board's EC (offsets 0x0E/0x0F duty, 0x22/0x23 RPM, 0x26/0xF1 temperature, plus SRAM-indirect temperature sensors), which this fork no longer targets:
+This section describes how the upstream project found *its* register map — it does not apply to the Sigma map above, which was found by a different process (firmware disassembly and live correlation against `coretemp`; see ["Reverse engineering the Sigma EC"](#reverse-engineering-the-sigma-ec)). Kept here as background on the original AMD-based board's EC (offsets 0x0E/0x0F duty, 0x22/0x23 RPM, 0x26/0xF1 temperature, plus SRAM-indirect temperature sensors), which this fork no longer targets:
 
 1. **DSDT analysis** — The ACPI tables revealed the EC at `\_SB_.PCI0.SBRG.EC0_` with command port 0x66 and data port 0x62, but contained no fan control methods — the firmware handles everything internally.
 2. **EC SRAM diffing** — Dumping the full 8KB SRAM at idle, under CPU stress, and during cooldown, then comparing the dumps to identify registers that track temperature, RPM, and duty cycle.
