@@ -47,11 +47,8 @@ You may also have found this page by searching for:
 - `IT5570 no driver Linux`
 - `IT5570 hwmon driver`
 - `IT5570E sensors-detect unknown chip`
-- `mini PC fan always on Linux`
-- `AceMagic fan control Linux`
-- `Beelink fan control Linux`
-- `MinisForum fan noise Linux`
-- `mini PC fan loud Linux no control`
+- `LattePanda Sigma fan control Linux`
+- `LattePanda Sigma fan always on Linux`
 
 ## Tested Hardware
 
@@ -120,7 +117,7 @@ The driver limits how bad a hung or crashed fan controller can get:
 
 Install [coolercontrol](https://gitlab.com/coolercontrol/coolercontrol) and it will automatically detect the hwmon interface. You can then create a custom fan curve using the CPU temperature sensor as input.
 
-## LattePanda Sigma port (work in progress)
+## LattePanda Sigma port
 
 This fork targets the [LattePanda Sigma](https://docs.lattepanda.com/content/sigma_edition/EC_Firmware/) (Intel Core i5-1340P), which also uses an ITE IT5570 EC (`sensors-detect`: "Found unknown chip with ID 0x5570" at 0x4E) — but with **completely different EC firmware**, so the register map above does not apply.
 
@@ -184,7 +181,7 @@ Live driver test (2026-08-20, kernel 6.12.103-1-MANJARO): the compiled module wa
 
 Suspend/resume test (2026-08-20): with manual mode at 80 % active, the system entered S3 and the resume hook re-applied the manual state — `pwm1`=204, `pwm1_enable`=1, fan back at 2478 RPM — with no driver warnings in the log. One platform caveat, unrelated to this driver: the Sigma wakes from S3 immediately (asleep for under a second, ACPI GPE 6D / PME_B0 firing with an xHCI "xHC error in resume, USBSTS 0x401" on every cycle). A control suspend with the module unloaded reproduced the instant wake exactly, so suspend-hold time is a firmware/USB issue, not an EC or driver one.
 
-Status: reads and fan control verified live, and the driver has since been adapted to this register map — register constants, PWM scaling (EC 0–100 % ↔ hwmon 0–255), and `pwm1_enable` mode mapping (0/1/2 → EC modes 3/1/2) are implemented and documented in `it5570_fan.c` and in "hwmon sysfs interface" below. The full live driver test, including suspend/resume, has passed. Remaining work: packaging.
+Status: reads and fan control verified live, and the driver has since been adapted to this register map — register constants, PWM scaling (EC 0–100 % ↔ hwmon 0–255), and `pwm1_enable` mode mapping (0/1/2 → EC modes 3/1/2) are implemented and documented in `it5570_fan.c` and in "hwmon sysfs interface" below. The full live driver test, including suspend/resume, has passed.
 
 ## Technical Background
 
@@ -200,7 +197,7 @@ The driver talks to the EC entirely through the ACPI EC ports (0x62/0x66), using
 
 ### EC register map
 
-This is the map the driver actually uses. It was recovered by live probing and firmware disassembly against the Sigma's EC firmware — see ["LattePanda Sigma port"](#lattepanda-sigma-port-work-in-progress) below for the full register table, the disassembly, and how each field was verified.
+This is the map the driver actually uses. It was recovered by live probing and firmware disassembly against the Sigma's EC firmware — see ["LattePanda Sigma port"](#lattepanda-sigma-port) above for the full register table, the disassembly, and how each field was verified.
 
 | Offset | R/W | Description |
 |---|---|---|
@@ -231,11 +228,13 @@ This section describes how the upstream project found *its* register map — it 
 
 ## Contributing
 
-If you have a mini PC with an ITE IT5570 EC, please test this driver and report your results by opening an issue with:
-- Your device brand and model
+If you have a LattePanda Sigma (or another LattePanda model carrying an ITE IT5570 EC), please test this driver and report your results by opening an issue with:
+- Your device model and EC firmware version
 - `sudo dmidecode -t system` output
 - `sensors` output with the module loaded
 - Whether fan control works correctly
+
+If you have one of the AMD-based mini PCs (AceMagic, Beelink, MinisForum, ...), this fork's DMI gate refuses to bind on your hardware — test and report against the [upstream project](https://github.com/passiveEndeavour/it5570-fan) instead.
 
 ## License
 
