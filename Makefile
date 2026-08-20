@@ -2,9 +2,10 @@ MOD   := it5570_fan
 KDIR  ?= /lib/modules/$(shell uname -r)/build
 BUILD := $(CURDIR)/build
 
-# CachyOS and other Clang-based kernel builds pass CC/LD on the command line.
-# When building against a GCC kernel the variables are simply not set and
-# the kernel Kbuild picks up its own defaults, so this works everywhere.
+# Kernels built with clang (e.g. CachyOS) need the LLVM toolchain for module
+# builds. Detect that from the kernel's .config; on GCC kernels nothing extra
+# is passed. Explicit CC=/LD=/LLVM= on the command line still override.
+LLVM ?= $(shell grep -qs '^CONFIG_CC_IS_CLANG=y' $(KDIR)/.config && echo 1)
 KBUILD_ARGS := $(if $(CC),CC=$(CC)) $(if $(LD),LD=$(LD)) $(if $(LLVM),LLVM=$(LLVM))
 
 .DEFAULT_GOAL := help

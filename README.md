@@ -81,15 +81,11 @@ DKMS rebuilds the module automatically on every kernel update. `make dkms-remove
 
 For a quick one-off test without installing anything: `make insmod` builds and loads the module (`make rmmod` unloads it when done). Build artifacts go to `build/`; `make clean` removes them. Plain `make` lists all targets.
 
-### CachyOS / Clang-built kernels
+### Clang-built kernels
 
-If your kernel was built with clang (CachyOS default), pass the compiler flags:
-
-```bash
-make all CC=clang LD=ld.lld
-```
-
-The DKMS installation handles this automatically.
+Kernels built with clang (e.g. CachyOS) are detected automatically from the
+kernel's `.config`, both for `make all` and the DKMS build — no flags needed.
+If detection fails, override manually with `make all LLVM=1`.
 
 ## Usage
 
