@@ -79,14 +79,14 @@ sudo modprobe it5570_fan
 
 DKMS rebuilds the module automatically on every kernel update. `make dkms-remove` uninstalls everything again (module, DKMS registration, boot autoload).
 
-For a quick one-off test without installing anything: `make && sudo insmod it5570_fan.ko` (and `sudo rmmod it5570_fan` when done).
+For a quick one-off test without installing anything: `make insmod` builds and loads the module (`make rmmod` unloads it when done). Build artifacts go to `build/`; `make clean` removes them. Plain `make` lists all targets.
 
 ### CachyOS / Clang-built kernels
 
 If your kernel was built with clang (CachyOS default), pass the compiler flags:
 
 ```bash
-make CC=clang LD=ld.lld
+make all CC=clang LD=ld.lld
 ```
 
 The DKMS installation handles this automatically.

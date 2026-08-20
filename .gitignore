@@ -1,4 +1,5 @@
 # Kernel build artefacts
+build/
 *.o
 *.ko
 *.ko.zst
