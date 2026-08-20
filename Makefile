@@ -35,9 +35,11 @@ dkms-install:
 	sudo dkms add $(DKMS_NAME)/$(DKMS_VER)
 	sudo dkms build $(DKMS_NAME)/$(DKMS_VER)
 	sudo dkms install $(DKMS_NAME)/$(DKMS_VER)
+	sudo install -Dm644 it5570_fan.conf /etc/modules-load.d/it5570_fan.conf
 
 dkms-remove:
 	sudo dkms remove $(DKMS_NAME)/$(DKMS_VER) --all
 	sudo rm -rf $(DKMS_SRC)
+	sudo rm -f /etc/modules-load.d/it5570_fan.conf
 
 .PHONY: all clean insmod rmmod dkms-install dkms-remove

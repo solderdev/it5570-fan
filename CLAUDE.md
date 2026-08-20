@@ -36,7 +36,10 @@ module unload. The live driver test (plan Task 8) ran 2026-08-20 and passed in
 full, including suspend/resume (load, manual duty, floor clamp, full speed,
 auto restore, unload — see README "Verification results"). The Sigma wakes
 from S3 instantly (xHCI/GPE-6D platform issue, reproduced without the module
-loaded — not driver-related). Remaining: packaging.
+loaded — not driver-related). Packaging was descoped 2026-08-20: no AUR/PKGBUILD
+(removed from the repo). The supported workflow is clone → `make dkms-install`
+(registers with DKMS, installs the module and the modules-load.d autoload) →
+configure a fan app such as coolercontrol.
 
 A live fan-control write test (0x2D=80 then 0x23=1) was run once with per-experiment
 approval on 2026-08-19 and worked; see README "Verification results". When writing,

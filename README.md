@@ -63,27 +63,23 @@ You may also have found this page by searching for:
 
 ## Installation
 
-### AUR (Arch, CachyOS, EndeavourOS, Manjaro)
+This fork is not published to the AUR — install straight from a clone.
+
+Prerequisites: `dkms` and the headers for your kernel (Manjaro/Arch: `sudo pacman -S dkms linux-headers`).
 
 ```bash
-yay -S it5570-fan-dkms
-```
-
-### Manual (any distro)
-
-```bash
-git clone https://github.com/passiveEndeavour/it5570-fan.git
+git clone <this repo>
 cd it5570-fan
 
-# Build and load
-make
-sudo insmod it5570_fan.ko
-
-# Or install with DKMS (persists across kernel updates)
+# Register with DKMS, build and install for the running kernel,
+# and enable auto-load at boot (modules-load.d):
 make dkms-install
+sudo modprobe it5570_fan
 ```
 
-The module auto-loads on boot if installed via the AUR package or DKMS. For manual installs, add `it5570_fan` to `/etc/modules-load.d/it5570_fan.conf`.
+DKMS rebuilds the module automatically on every kernel update. `make dkms-remove` uninstalls everything again (module, DKMS registration, boot autoload).
+
+For a quick one-off test without installing anything: `make && sudo insmod it5570_fan.ko` (and `sudo rmmod it5570_fan` when done).
 
 ### CachyOS / Clang-built kernels
 
@@ -93,7 +89,7 @@ If your kernel was built with clang (CachyOS default), pass the compiler flags:
 make CC=clang LD=ld.lld
 ```
 
-The DKMS and AUR installations handle this automatically.
+The DKMS installation handles this automatically.
 
 ## Usage
 
