@@ -32,7 +32,9 @@ is Sigma-only, gated on a DMI match, and refuses to bind on the upstream AMD
 hardware. Manual duty is floored at 10% and pwm1_enable maps 0=full/1=manual/2=EC
 auto curve; suspend hands the fan to the EC auto curve and resume re-applies the
 manual/full state that was active before suspend, restoring EC auto control on
-module unload. Remaining: the live driver test (plan Task 8) has not run yet, then
+module unload. The live driver test (plan Task 8) ran 2026-08-20 and passed
+(load, manual duty, floor clamp, full speed, auto restore, unload — see README
+"Verification results"). Remaining: the suspend/resume leg of Task 8, then
 packaging.
 
 A live fan-control write test (0x2D=80 then 0x23=1) was run once with per-experiment
