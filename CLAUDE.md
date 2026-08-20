@@ -32,10 +32,11 @@ is Sigma-only, gated on a DMI match, and refuses to bind on the upstream AMD
 hardware. Manual duty is floored at 10% and pwm1_enable maps 0=full/1=manual/2=EC
 auto curve; suspend hands the fan to the EC auto curve and resume re-applies the
 manual/full state that was active before suspend, restoring EC auto control on
-module unload. The live driver test (plan Task 8) ran 2026-08-20 and passed
-(load, manual duty, floor clamp, full speed, auto restore, unload — see README
-"Verification results"). Remaining: the suspend/resume leg of Task 8, then
-packaging.
+module unload. The live driver test (plan Task 8) ran 2026-08-20 and passed in
+full, including suspend/resume (load, manual duty, floor clamp, full speed,
+auto restore, unload — see README "Verification results"). The Sigma wakes
+from S3 instantly (xHCI/GPE-6D platform issue, reproduced without the module
+loaded — not driver-related). Remaining: packaging.
 
 A live fan-control write test (0x2D=80 then 0x23=1) was run once with per-experiment
 approval on 2026-08-19 and worked; see README "Verification results". When writing,

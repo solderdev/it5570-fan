@@ -57,7 +57,7 @@ You may also have found this page by searching for:
 
 | Device | APU | EC firmware | Status |
 |---|---|---|---|
-| LattePanda Sigma | Intel Core i5-1340P (Alder Lake-P) | ITE EC-V14.6, `LP-EC-WTADLC1R210-V1.02` | Driver tested live end-to-end (2026-08-20, kernel 6.12.103): load, manual duty, 10 % floor clamp, full speed, auto restore, unload — see "Verification results". Suspend/resume test still pending |
+| LattePanda Sigma | Intel Core i5-1340P (Alder Lake-P) | ITE EC-V14.6, `LP-EC-WTADLC1R210-V1.02` | Driver tested live end-to-end (2026-08-20, kernel 6.12.103): load, manual duty, 10 % floor clamp, full speed, auto restore, unload, suspend/resume — see "Verification results" |
 
 *Supported by the upstream project, not this fork:* the AMD Phoenix/Hawk Point white-label mini PCs (AceMagic, Beelink, MinisForum, etc.) that the original project targets also carry an ITE IT5570 EC, but with a completely different register layout. This fork's DMI gate refuses to bind on that hardware; use the [upstream project](https://github.com/passiveEndeavour/it5570-fan) there instead.
 
@@ -188,9 +188,11 @@ Live test on EC firmware V1.02: writing 0x2D=80 then 0x23=1 raised the fan from 
 
 Mode 3 full-speed test (2026-08-19): at 50 °C baseline, writing 0x2D=50 then 0x23=3 raised the fan from ~1264 to ~3028 RPM within 5 s, well above the 2481 RPM observed at 80 % duty in manual mode. Restoring 0x23=2 returned control to the EC; RPM decayed to 3007, confirming expected firmware ramp-down. Mode 3 verified as full speed; `pwm1_enable=0` may safely map to mode 3.
 
-Live driver test (2026-08-20, kernel 6.12.103-1-MANJARO): the compiled module was loaded and exercised end-to-end through sysfs. Probe reported CPU 50 °C, 2867 RPM, mode 2, and all reads tracked the EC (temp1_input in m°C, `temp1_label` = CPU, `pwm1_enable` = 2). Manual mode at `pwm1`=204 (80 %) reached 2487 RPM, matching the 2481 RPM raw-port result. Writing `pwm1`=0 clamped to the 10 % floor (readback 26) with the fan stable and spinning at ~209 RPM. `pwm1_enable`=0 (EC mode 3) reached 3028 RPM with `pwm1` reading 255; `pwm1_enable`=2 handed control back to the auto curve with the usual gradual ramp-down, and `rmmod` logged "fan control restored to auto mode". The suspend/resume leg has not run yet (needs local access to wake the machine).
+Live driver test (2026-08-20, kernel 6.12.103-1-MANJARO): the compiled module was loaded and exercised end-to-end through sysfs. Probe reported CPU 50 °C, 2867 RPM, mode 2, and all reads tracked the EC (temp1_input in m°C, `temp1_label` = CPU, `pwm1_enable` = 2). Manual mode at `pwm1`=204 (80 %) reached 2487 RPM, matching the 2481 RPM raw-port result. Writing `pwm1`=0 clamped to the 10 % floor (readback 26) with the fan stable and spinning at ~209 RPM. `pwm1_enable`=0 (EC mode 3) reached 3028 RPM with `pwm1` reading 255; `pwm1_enable`=2 handed control back to the auto curve with the usual gradual ramp-down, and `rmmod` logged "fan control restored to auto mode".
 
-Status: reads and fan control verified live, and the driver has since been adapted to this register map — register constants, PWM scaling (EC 0–100 % ↔ hwmon 0–255), and `pwm1_enable` mode mapping (0/1/2 → EC modes 3/1/2) are implemented and documented in `it5570_fan.c` and in "hwmon sysfs interface" below. Remaining work: the suspend/resume live test, then packaging.
+Suspend/resume test (2026-08-20): with manual mode at 80 % active, the system entered S3 and the resume hook re-applied the manual state — `pwm1`=204, `pwm1_enable`=1, fan back at 2478 RPM — with no driver warnings in the log. One platform caveat, unrelated to this driver: the Sigma wakes from S3 immediately (asleep for under a second, ACPI GPE 6D / PME_B0 firing with an xHCI "xHC error in resume, USBSTS 0x401" on every cycle). A control suspend with the module unloaded reproduced the instant wake exactly, so suspend-hold time is a firmware/USB issue, not an EC or driver one.
+
+Status: reads and fan control verified live, and the driver has since been adapted to this register map — register constants, PWM scaling (EC 0–100 % ↔ hwmon 0–255), and `pwm1_enable` mode mapping (0/1/2 → EC modes 3/1/2) are implemented and documented in `it5570_fan.c` and in "hwmon sysfs interface" below. The full live driver test, including suspend/resume, has passed. Remaining work: packaging.
 
 ## Technical Background
 
