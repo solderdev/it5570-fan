@@ -2,6 +2,10 @@
 /*
  * LattePanda Sigma fan control driver (ITE IT5570 EC)
  *
+ * Copyright (C) 2026 Michael (original IT5570 EC driver,
+ *   https://github.com/passiveEndeavour/it5570-fan)
+ * Copyright (C) 2026 solderdev (LattePanda Sigma port)
+ *
  * hwmon interface for the DFRobot LattePanda Sigma's EC fan control.
  * Sigma-only: the same IT5570 chip ID appears on unrelated boards
  * (including the upstream AMD mini-PCs this driver was forked from)
@@ -712,5 +716,6 @@ module_init(it5570_init);
 module_exit(it5570_exit);
 
 MODULE_AUTHOR("Michael");
+MODULE_AUTHOR("solderdev");
 MODULE_DESCRIPTION("LattePanda Sigma fan control driver (ITE IT5570 EC)");
 MODULE_LICENSE("GPL");

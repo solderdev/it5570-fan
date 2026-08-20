@@ -65,7 +65,7 @@ This fork is not published to the AUR — install straight from a clone.
 Prerequisites: `dkms` and the headers for your kernel (Manjaro/Arch: `sudo pacman -S dkms linux-headers`).
 
 ```bash
-git clone <this repo>
+git clone https://github.com/solderdev/it5570-fan.git
 cd it5570-fan
 
 # Register with DKMS, build and install for the running kernel,
