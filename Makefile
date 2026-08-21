@@ -45,7 +45,7 @@ rmmod: ## unload the module
 # DKMS helpers (run from repo checkout). DKMS_VER expands lazily so
 # `git describe` only runs when a dkms target actually uses it.
 DKMS_NAME := it5570-fan
-DKMS_VER   = $(shell git describe --tags --abbrev=0 2>/dev/null || echo "0.1.0")
+DKMS_VER   = $(shell { git describe --tags --abbrev=0 2>/dev/null || echo "v0.1.0"; } | sed 's/^v//')
 DKMS_SRC   = /usr/src/$(DKMS_NAME)-$(DKMS_VER)
 
 dkms-install: ## register with DKMS, install module and autoload config
