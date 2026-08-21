@@ -91,6 +91,7 @@ struct it5570_data {
 	unsigned long last_updated;
 	bool valid;
 	bool temp_valid;	/* at least one plausible temp sample cached */
+	bool shutting_down;	/* shutdown restored auto mode; refuse new writes */
 
 	/* Cached sensor values */
 	unsigned int fan_rpm;
@@ -496,7 +497,7 @@ static int it5570_read_string(struct device *dev, enum hwmon_sensor_types type,
 }
 
 static int it5570_write(struct device *dev, enum hwmon_sensor_types type,
-			 u32 attr, int channel, long val)
+			u32 attr, int channel, long val)
 {
 	struct it5570_data *data = dev_get_drvdata(dev);
 	unsigned int duty;
@@ -505,18 +506,22 @@ static int it5570_write(struct device *dev, enum hwmon_sensor_types type,
 	if (type != hwmon_pwm)
 		return -EOPNOTSUPP;
 
+	mutex_lock(&data->lock);
+
+	if (data->shutting_down) {
+		mutex_unlock(&data->lock);
+		return -EBUSY;
+	}
+
 	switch (attr) {
 	case hwmon_pwm_input:
 		/* Convert hwmon 0-255 to EC percent; never switches modes */
-		val = clamp_val(val, 0, HWMON_PWM_MAX);
-		val = DIV_ROUND_CLOSEST(val * EC_DUTY_MAX, HWMON_PWM_MAX);
-		mutex_lock(&data->lock);
-		ret = it5570_write_duty(data, val);
-		mutex_unlock(&data->lock);
-		return ret;
+		duty = clamp_val(val, 0, HWMON_PWM_MAX);
+		duty = DIV_ROUND_CLOSEST(duty * EC_DUTY_MAX, HWMON_PWM_MAX);
+		ret = it5570_write_duty(data, duty);
+		break;
 
 	case hwmon_pwm_enable:
-		mutex_lock(&data->lock);
 		switch (val) {
 		case 0:	/* hwmon convention: full speed */
 			ret = it5570_set_mode(data, EC_FAN_MODE_FULL);
@@ -534,12 +539,15 @@ static int it5570_write(struct device *dev, enum hwmon_sensor_types type,
 			ret = -EINVAL;
 			break;
 		}
-		mutex_unlock(&data->lock);
-		return ret;
+		break;
 
 	default:
-		return -EOPNOTSUPP;
+		ret = -EOPNOTSUPP;
+		break;
 	}
+
+	mutex_unlock(&data->lock);
+	return ret;
 }
 
 static const struct hwmon_channel_info * const it5570_info[] = {
@@ -640,6 +648,7 @@ static void it5570_shutdown(struct platform_device *pdev)
 	int ret;
 
 	mutex_lock(&data->lock);
+	data->shutting_down = true;
 	ret = ec_write_byte(EC_REG_FAN_MODE, EC_FAN_MODE_AUTO);
 	mutex_unlock(&data->lock);
 	if (ret)
