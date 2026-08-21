@@ -108,28 +108,33 @@ static DEFINE_MUTEX(ec_io_mutex);
  * handling. The kernel ec_read/ec_write functions may not be exported
  * on all configurations.
  */
+/*
+ * Poll the EC status register until (status & mask) == val, for up to
+ * 100 ms. Sleeping poll: every caller is process context holding
+ * ec_io_mutex, and per-byte EC latency dwarfs scheduler wakeup jitter.
+ */
+static int ec_wait_status(u8 mask, u8 val)
+{
+	unsigned long timeout = jiffies + msecs_to_jiffies(100);
+
+	do {
+		if ((inb(EC_SC) & mask) == val)
+			return 0;
+		usleep_range(50, 150);
+	} while (time_before(jiffies, timeout));
+
+	/* one last look: we may have slept past the deadline */
+	return (inb(EC_SC) & mask) == val ? 0 : -ETIMEDOUT;
+}
+
 static int ec_wait_ibf_clear(void)
 {
-	int i;
-
-	for (i = 0; i < 10000; i++) {
-		if (!(inb(EC_SC) & EC_SC_IBF))
-			return 0;
-		udelay(10);
-	}
-	return -ETIMEDOUT;
+	return ec_wait_status(EC_SC_IBF, 0);
 }
 
 static int ec_wait_obf_set(void)
 {
-	int i;
-
-	for (i = 0; i < 10000; i++) {
-		if (inb(EC_SC) & EC_SC_OBF)
-			return 0;
-		udelay(10);
-	}
-	return -ETIMEDOUT;
+	return ec_wait_status(EC_SC_OBF, EC_SC_OBF);
 }
 
 /*
