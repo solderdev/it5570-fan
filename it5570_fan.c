@@ -255,7 +255,7 @@ static int it5570_detect(void)
  */
 static int it5570_update(struct it5570_data *data)
 {
-	u8 hi, lo, duty, mode, temp;
+	u8 hi, hi2, lo, duty, mode, temp;
 	int ret;
 
 	lockdep_assert_held(&data->lock);
@@ -269,6 +269,21 @@ static int it5570_update(struct it5570_data *data)
 	ret = ec_read_byte(EC_REG_FAN_RPM_LO, &lo);
 	if (ret)
 		goto err;
+	/*
+	 * hi/lo are two separate EC transactions; if the count crossed a
+	 * 256-count boundary in between, the pair is torn. Re-read hi and
+	 * retry lo once - a second consecutive tear is vanishingly rare
+	 * and costs one glitchy 1 Hz sample, not a control decision.
+	 */
+	ret = ec_read_byte(EC_REG_FAN_RPM_HI, &hi2);
+	if (ret)
+		goto err;
+	if (hi2 != hi) {
+		hi = hi2;
+		ret = ec_read_byte(EC_REG_FAN_RPM_LO, &lo);
+		if (ret)
+			goto err;
+	}
 	ret = ec_read_byte(EC_REG_FAN_DUTY, &duty);
 	if (ret)
 		goto err;
