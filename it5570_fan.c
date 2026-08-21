@@ -83,12 +83,14 @@
 #define EC_DUTY_MIN		10	/* safety floor for manual duty */
 #define EC_DUTY_MAX		100
 #define EC_DUTY_DEFAULT		50	/* used when no sane cached duty exists */
+#define EC_TEMP_MAX_C		120	/* plausibility ceiling; above = EC read glitch */
 #define HWMON_PWM_MAX		255
 
 struct it5570_data {
 	struct mutex lock;
 	unsigned long last_updated;
 	bool valid;
+	bool temp_valid;	/* at least one plausible temp sample cached */
 
 	/* Cached sensor values */
 	unsigned int fan_rpm;
@@ -299,7 +301,13 @@ static int it5570_update(struct it5570_data *data)
 		data->fan_rpm = 0;	/* saturated tach: stopped/unplugged */
 	data->fan_duty = duty;
 	data->fan_mode = mode;
-	data->cpu_temp = temp;
+	if (temp == 0 || temp > EC_TEMP_MAX_C) {
+		pr_warn_ratelimited(DRIVER_NAME ": implausible CPU temp %u, keeping last value\n",
+				    temp);
+	} else {
+		data->cpu_temp = temp;
+		data->temp_valid = true;
+	}
 
 	if (mode < EC_FAN_MODE_MANUAL || mode > EC_FAN_MODE_FULL)
 		pr_warn_ratelimited(DRIVER_NAME ": unexpected fan mode %u\n",
@@ -459,6 +467,10 @@ static int it5570_read(struct device *dev, enum hwmon_sensor_types type,
 		break;
 
 	case hwmon_temp:
+		if (!data->temp_valid) {
+			ret = -EIO;	/* never seen a plausible sample */
+			break;
+		}
 		/* hwmon temperatures are in millidegrees C */
 		*val = data->cpu_temp * 1000;
 		break;
@@ -603,7 +615,7 @@ static int it5570_probe(struct platform_device *pdev)
 	/* Initial read; hwmon sysfs is already live, so snapshot under lock */
 	mutex_lock(&data->lock);
 	ret = it5570_update(data);
-	if (ret == 0)
+	if (ret == 0 && data->temp_valid)
 		dev_info(&pdev->dev,
 			 "CPU: %u°C, fan: %u RPM (%u%% duty, mode %u)\n",
 			 data->cpu_temp, data->fan_rpm, data->fan_duty,
