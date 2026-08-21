@@ -87,7 +87,7 @@
 #define HWMON_PWM_MAX		255
 
 struct it5570_data {
-	struct mutex lock;
+	struct mutex lock;	/* guards cached fields and cache->EC-write ordering */
 	unsigned long last_updated;
 	bool valid;
 	bool temp_valid;	/* at least one plausible temp sample cached */
@@ -390,8 +390,8 @@ static int it5570_set_mode(struct it5570_data *data, unsigned int mode)
  * hwmon interface
  */
 static umode_t it5570_is_visible(const void *drvdata,
-				  enum hwmon_sensor_types type,
-				  u32 attr, int channel)
+				 enum hwmon_sensor_types type,
+				 u32 attr, int channel)
 {
 	switch (type) {
 	case hwmon_fan:
@@ -608,13 +608,14 @@ static int it5570_probe(struct platform_device *pdev)
 	mutex_init(&data->lock);
 
 	ret = devm_add_action_or_reset(&pdev->dev, it5570_restore_auto_action,
-					data);
+				       data);
 	if (ret)
 		return ret;
 
-	hwmon_dev = devm_hwmon_device_register_with_info(
-		&pdev->dev, DRIVER_NAME, data,
-		&it5570_chip_info, NULL);
+	hwmon_dev = devm_hwmon_device_register_with_info(&pdev->dev,
+							 DRIVER_NAME, data,
+							 &it5570_chip_info,
+							 NULL);
 	if (IS_ERR(hwmon_dev))
 		return PTR_ERR(hwmon_dev);
 
