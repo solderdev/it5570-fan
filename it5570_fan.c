@@ -250,17 +250,18 @@ static int it5570_detect(void)
 }
 
 /*
- * Update cached sensor data (rate-limited to 1 Hz)
+ * Update cached sensor data (rate-limited to 1 Hz).
+ * Caller must hold data->lock.
  */
 static int it5570_update(struct it5570_data *data)
 {
 	u8 hi, lo, duty, mode, temp;
 	int ret;
 
-	mutex_lock(&data->lock);
+	lockdep_assert_held(&data->lock);
 
 	if (data->valid && time_before(jiffies, data->last_updated + HZ))
-		goto out;
+		return 0;
 
 	ret = ec_read_byte(EC_REG_FAN_RPM_HI, &hi);
 	if (ret)
@@ -291,14 +292,10 @@ static int it5570_update(struct it5570_data *data)
 
 	data->last_updated = jiffies;
 	data->valid = true;
-
-out:
-	mutex_unlock(&data->lock);
 	return 0;
 
 err:
 	data->valid = false;
-	mutex_unlock(&data->lock);
 	return ret;
 }
 
@@ -397,19 +394,21 @@ static umode_t it5570_is_visible(const void *drvdata,
 }
 
 static int it5570_read(struct device *dev, enum hwmon_sensor_types type,
-			u32 attr, int channel, long *val)
+		       u32 attr, int channel, long *val)
 {
 	struct it5570_data *data = dev_get_drvdata(dev);
 	int ret;
 
+	mutex_lock(&data->lock);
+
 	ret = it5570_update(data);
 	if (ret)
-		return ret;
+		goto out;
 
 	switch (type) {
 	case hwmon_fan:
 		*val = data->fan_rpm;
-		return 0;
+		break;
 
 	case hwmon_pwm:
 		switch (attr) {
@@ -424,7 +423,7 @@ static int it5570_read(struct device *dev, enum hwmon_sensor_types type,
 							     HWMON_PWM_MAX,
 							     EC_DUTY_MAX),
 					   (unsigned int)HWMON_PWM_MAX);
-			return 0;
+			break;
 		case hwmon_pwm_enable:
 			switch (data->fan_mode) {
 			case EC_FAN_MODE_AUTO:
@@ -437,19 +436,26 @@ static int it5570_read(struct device *dev, enum hwmon_sensor_types type,
 				*val = 1;
 				break;
 			}
-			return 0;
+			break;
 		default:
-			return -EOPNOTSUPP;
+			ret = -EOPNOTSUPP;
+			break;
 		}
+		break;
 
 	case hwmon_temp:
 		/* hwmon temperatures are in millidegrees C */
 		*val = data->cpu_temp * 1000;
-		return 0;
+		break;
 
 	default:
-		return -EOPNOTSUPP;
+		ret = -EOPNOTSUPP;
+		break;
 	}
+
+out:
+	mutex_unlock(&data->lock);
+	return ret;
 }
 
 static int it5570_read_string(struct device *dev, enum hwmon_sensor_types type,
@@ -579,15 +585,17 @@ static int it5570_probe(struct platform_device *pdev)
 
 	platform_set_drvdata(pdev, data);
 
-	/* Initial read */
+	/* Initial read; hwmon sysfs is already live, so snapshot under lock */
+	mutex_lock(&data->lock);
 	ret = it5570_update(data);
-	if (ret)
-		dev_warn(&pdev->dev, "initial EC read failed (%d)\n", ret);
-	else
+	if (ret == 0)
 		dev_info(&pdev->dev,
 			 "CPU: %u°C, fan: %u RPM (%u%% duty, mode %u)\n",
 			 data->cpu_temp, data->fan_rpm, data->fan_duty,
 			 data->fan_mode);
+	mutex_unlock(&data->lock);
+	if (ret)
+		dev_warn(&pdev->dev, "initial EC read failed (%d)\n", ret);
 
 	return 0;
 }
