@@ -25,7 +25,7 @@ CPU:          +48.0 C
 pwm1:             64%
 ```
 
-`pwm1` reports the *last commanded* manual duty cycle, not the EC auto curve's live output — the EC exposes no readback of what the auto curve is currently doing, so in `pwm1_enable=2` (auto) this value is stale/last-known rather than live.
+`pwm1` shows the *last commanded* manual duty, not the auto curve's live output — see ["hwmon sysfs interface"](#hwmon-sysfs-interface) for why.
 
 The `64%` above is an lm-sensors display quirk, not the duty: `sensors` 3.6.2 prints `pwm1` as the raw sysfs value divided by 2 (the sysfs `pwm1` at capture time was 128, i.e. 50 % EC duty; 204 displays as `102%`). Read `/sys/class/hwmon/hwmonN/pwm1` for the true hwmon 0–255 value.
 
@@ -56,11 +56,7 @@ You may also have found this page by searching for:
 |---|---|---|---|
 | LattePanda Sigma | Intel Core i5-1340P (Alder Lake-P) | ITE EC-V14.6, `LP-EC-WTADLC1R210-V1.02` | Tested live end-to-end on kernel 6.12: load, manual duty, 10 % floor clamp, full speed, auto restore, unload, suspend/resume — see [Verification results](#verification-results) |
 
-*Supported by the upstream project, not this fork:* the AMD Phoenix/Hawk Point white-label mini PCs (AceMagic, Beelink, MinisForum, etc.) that the original project targets also carry an ITE IT5570 EC, but with a completely different register layout. This fork's DMI gate refuses to bind on that hardware; use the [upstream project](https://github.com/passiveEndeavour/it5570-fan) there instead.
-
 ## Installation
-
-This fork is not published to the AUR — install straight from a clone.
 
 Prerequisites: `dkms` and the headers for your kernel (Manjaro/Arch: `sudo pacman -S dkms linux-headers`).
 
@@ -187,26 +183,17 @@ Everything above is implemented in the driver: register constants, PWM scaling (
 
 The IT5570 is an embedded controller (EC) from ITE Tech, built around an 8051 microcontroller core. Unlike ITE's Super I/O chips (IT8613, IT8720, etc.) which have well-documented hardware monitoring registers, the IT5570 is a programmable EC whose register layout is defined entirely by its firmware. There is no public programming guide for the fan control interface — the register map was determined through reverse engineering.
 
-The IT5570 is commonly found in budget mini PCs, particularly white-label AMD Phoenix/Hawk Point systems sold under brands like AceMagic, Beelink, MinisForum, and others. These systems typically ship with no thermal management under Linux beyond the EC's built-in fan curve.
+The IT5570 is commonly found in budget mini PCs — besides the LattePanda Sigma, notably the white-label AMD Phoenix/Hawk Point systems the upstream project targets. These systems typically ship with no thermal management under Linux beyond the EC's built-in fan curve.
 
 ### How it works
 
-The driver talks to the EC entirely through the ACPI EC ports (0x62/0x66), using the standard read (cmd 0x80) and write (cmd 0x81) transactions. On the Sigma this raw port I/O is mandatory, not just an implementation choice: the DSDT declares the EC device but its `_STA` returns zero, so the kernel's own ACPI EC driver never binds and `ec_sys` exposes nothing. The Super I/O ports (0x4E/0x4F) are used only once, at module load, to confirm the IT5570 chip ID before probing further — the Sigma has no extended-temperature SRAM sensors reachable through them the way the original AMD-based hardware did.
+The driver talks to the EC entirely through the ACPI EC ports (0x62/0x66), using the standard read (cmd 0x80) and write (cmd 0x81) transactions. On the Sigma this raw port I/O is mandatory, not just an implementation choice — the DSDT disables the EC device, so the kernel's own ACPI EC driver never binds (details under ["Reverse engineering the Sigma EC"](#reverse-engineering-the-sigma-ec)). The Super I/O ports (0x4E/0x4F) are used only once, at module load, to confirm the IT5570 chip ID before probing further — the Sigma has no extended-temperature SRAM sensors reachable through them the way the original AMD-based hardware did.
 
-### EC register map
-
-This is the map the driver actually uses. It was recovered by live probing and firmware disassembly against the Sigma's EC firmware — see ["Reverse engineering the Sigma EC"](#reverse-engineering-the-sigma-ec) above for the full register table, the disassembly, and how each field was verified.
-
-| Offset | R/W | Description |
-|---|---|---|
-| 0x23 | R/W | Fan mode: 1 = manual, 2 = auto curve (default), 3 = full speed (0 = off; the driver never writes it) |
-| 0x2D | R/W | Manual duty percent (0–100), applied only while mode = 1 |
-| 0x2E/0x2F | R | Fan RPM, 16-bit big-endian |
-| 0x70 | R | CPU temperature, °C |
+The registers the driver uses — fan mode 0x23, manual duty 0x2D, RPM 0x2E/0x2F, CPU temperature 0x70 — are documented in the full verified register table under ["Reverse engineering the Sigma EC"](#reverse-engineering-the-sigma-ec), along with how each field was recovered.
 
 ### Reverse engineering methodology (original AMD hardware)
 
-This section describes how the upstream project found *its* register map — it does not apply to the Sigma map above, which was found by a different process (firmware disassembly and live correlation against `coretemp`; see ["Reverse engineering the Sigma EC"](#reverse-engineering-the-sigma-ec)). Kept here as background on the original AMD-based board's EC (offsets 0x0E/0x0F duty, 0x22/0x23 RPM, 0x26/0xF1 temperature, plus SRAM-indirect temperature sensors), which this fork no longer targets:
+This section describes how the upstream project found *its* register map — the Sigma map was recovered by a different process (firmware disassembly and live correlation against `coretemp`; see ["Reverse engineering the Sigma EC"](#reverse-engineering-the-sigma-ec)). Kept here as background on the original AMD-based board's EC (offsets 0x0E/0x0F duty, 0x22/0x23 RPM, 0x26/0xF1 temperature, plus SRAM-indirect temperature sensors), which this fork no longer targets:
 
 1. **DSDT analysis** — The ACPI tables revealed the EC at `\_SB_.PCI0.SBRG.EC0_` with command port 0x66 and data port 0x62, but contained no fan control methods — the firmware handles everything internally.
 2. **EC SRAM diffing** — Dumping the full 8KB SRAM at idle, under CPU stress, and during cooldown, then comparing the dumps to identify registers that track temperature, RPM, and duty cycle.
@@ -222,7 +209,7 @@ This section describes how the upstream project found *its* register map — it 
 | `pwm1` | Fan duty, scaled 0–255 from the EC's native 0–100 % (`pwm1 = round(EC% * 255 / 100)`). While `pwm1_enable=2` (auto), reports the *last commanded* manual duty rather than the EC auto curve's live output — the EC exposes no readback of what the curve is currently doing. |
 | `pwm1_enable` | `0` = full speed (EC mode 3) · `1` = manual (EC mode 1) · `2` = EC automatic curve (EC mode 2, default) |
 
-**10 % manual-duty floor:** the driver clamps every manual-mode duty write to a 10–100 % range — deliberately deviating from the hwmon convention that `pwm1 = 0` means "fan off". Writing `pwm1 = 0` does **not** stop the fan: it lands at the 10 % floor like every other value below 26, so `pwm1` values 0–25 are accepted but round-trip up to 26 on readback (`round(10% * 255 / 100) = 26`) and are unreachable when reading back. Consequences for tooling: a fan-curve app (e.g. coolercontrol) with a 0 % point keeps the fan spinning at 10 % duty there, and `pwmconfig` will find the fan never fully stops and record `MINPWM` around 26 instead of 0 — that's the floor working as intended, not a bug.
+**10 % manual-duty floor:** the driver clamps every manual-mode duty write to a 10–100 % range — deliberately deviating from the hwmon convention that `pwm1 = 0` means "fan off". Writing `pwm1 = 0` does **not** stop the fan: it lands at the 10 % floor like every other value below 26, so `pwm1` values 0–25 are accepted but round-trip up to 26 on readback (`round(10% * 255 / 100) = 26`). Consequences for tooling: a fan-curve app (e.g. coolercontrol) with a 0 % point keeps the fan spinning at 10 % duty there, and `pwmconfig` will find the fan never fully stops and record `MINPWM` around 26 instead of 0 — that's the floor working as intended, not a bug.
 
 ## Contributing
 
@@ -232,8 +219,12 @@ If you have a LattePanda Sigma (or another LattePanda model carrying an ITE IT55
 - `sensors` output with the module loaded
 - Whether fan control works correctly
 
-If you have one of the AMD-based mini PCs (AceMagic, Beelink, MinisForum, ...), this fork's DMI gate refuses to bind on your hardware — test and report against the [upstream project](https://github.com/passiveEndeavour/it5570-fan) instead.
+If you have one of the AMD-based mini PCs instead, test and report against the [upstream project](https://github.com/passiveEndeavour/it5570-fan) — this fork won't bind on your hardware.
 
 ## License
 
 GPL-2.0 — see the [SPDX identifier](https://spdx.org/licenses/GPL-2.0-only.html) in the source.
+
+---
+
+*This driver and its documentation were created with AI support (Claude Code): EC firmware reverse engineering, the port from the upstream driver, and live verification were done in collaboration with the tool, with all fan-control experiments and results validated on real hardware.*
