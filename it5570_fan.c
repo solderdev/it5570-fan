@@ -37,6 +37,7 @@
 #include <linux/init.h>
 #include <linux/hwmon.h>
 #include <linux/io.h>
+#include <linux/ioport.h>
 #include <linux/delay.h>
 #include <linux/mutex.h>
 #include <linux/jiffies.h>
@@ -691,25 +692,50 @@ static int __init it5570_init(void)
 	if (ret)
 		return ret;
 
+	/*
+	 * Hold the EC ports for the driver's lifetime so no other
+	 * port-banging driver can interleave with our multi-step EC
+	 * transactions. The ACPI EC driver never binds here (_STA=0),
+	 * so the ports are unclaimed. Not adjacent - two regions.
+	 */
+	if (!request_region(EC_DATA, 1, DRIVER_NAME)) {
+		pr_err(DRIVER_NAME ": EC data port 0x%02x busy\n", EC_DATA);
+		return -EBUSY;
+	}
+	if (!request_region(EC_SC, 1, DRIVER_NAME)) {
+		pr_err(DRIVER_NAME ": EC command port 0x%02x busy\n", EC_SC);
+		ret = -EBUSY;
+		goto err_release_data;
+	}
+
 	ret = platform_driver_register(&it5570_driver);
 	if (ret)
-		return ret;
+		goto err_release_sc;
 
 	it5570_pdev = platform_device_register_simple(DRIVER_NAME, -1,
-						       NULL, 0);
+						      NULL, 0);
 	if (IS_ERR(it5570_pdev)) {
 		ret = PTR_ERR(it5570_pdev);
-		platform_driver_unregister(&it5570_driver);
-		return ret;
+		goto err_driver;
 	}
 
 	return 0;
+
+err_driver:
+	platform_driver_unregister(&it5570_driver);
+err_release_sc:
+	release_region(EC_SC, 1);
+err_release_data:
+	release_region(EC_DATA, 1);
+	return ret;
 }
 
 static void __exit it5570_exit(void)
 {
 	platform_device_unregister(it5570_pdev);
 	platform_driver_unregister(&it5570_driver);
+	release_region(EC_SC, 1);
+	release_region(EC_DATA, 1);
 }
 
 module_init(it5570_init);
