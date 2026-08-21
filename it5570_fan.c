@@ -37,6 +37,7 @@
 #include <linux/init.h>
 #include <linux/hwmon.h>
 #include <linux/io.h>
+#include <linux/ioport.h>
 #include <linux/delay.h>
 #include <linux/mutex.h>
 #include <linux/jiffies.h>
@@ -82,12 +83,15 @@
 #define EC_DUTY_MIN		10	/* safety floor for manual duty */
 #define EC_DUTY_MAX		100
 #define EC_DUTY_DEFAULT		50	/* used when no sane cached duty exists */
+#define EC_TEMP_MAX_C		120	/* plausibility ceiling; above = EC read glitch */
 #define HWMON_PWM_MAX		255
 
 struct it5570_data {
-	struct mutex lock;
+	struct mutex lock;	/* guards cached fields and cache->EC-write ordering */
 	unsigned long last_updated;
 	bool valid;
+	bool temp_valid;	/* at least one plausible temp sample cached */
+	bool shutting_down;	/* shutdown restored auto mode; refuse new writes */
 
 	/* Cached sensor values */
 	unsigned int fan_rpm;
@@ -107,28 +111,33 @@ static DEFINE_MUTEX(ec_io_mutex);
  * handling. The kernel ec_read/ec_write functions may not be exported
  * on all configurations.
  */
+/*
+ * Poll the EC status register until (status & mask) == val, for up to
+ * 100 ms. Sleeping poll: every caller is process context holding
+ * ec_io_mutex, and per-byte EC latency dwarfs scheduler wakeup jitter.
+ */
+static int ec_wait_status(u8 mask, u8 val)
+{
+	unsigned long timeout = jiffies + msecs_to_jiffies(100);
+
+	do {
+		if ((inb(EC_SC) & mask) == val)
+			return 0;
+		usleep_range(50, 150);
+	} while (time_before(jiffies, timeout));
+
+	/* one last look: we may have slept past the deadline */
+	return (inb(EC_SC) & mask) == val ? 0 : -ETIMEDOUT;
+}
+
 static int ec_wait_ibf_clear(void)
 {
-	int i;
-
-	for (i = 0; i < 10000; i++) {
-		if (!(inb(EC_SC) & EC_SC_IBF))
-			return 0;
-		udelay(10);
-	}
-	return -ETIMEDOUT;
+	return ec_wait_status(EC_SC_IBF, 0);
 }
 
 static int ec_wait_obf_set(void)
 {
-	int i;
-
-	for (i = 0; i < 10000; i++) {
-		if (inb(EC_SC) & EC_SC_OBF)
-			return 0;
-		udelay(10);
-	}
-	return -ETIMEDOUT;
+	return ec_wait_status(EC_SC_OBF, EC_SC_OBF);
 }
 
 /*
@@ -244,17 +253,18 @@ static int it5570_detect(void)
 }
 
 /*
- * Update cached sensor data (rate-limited to 1 Hz)
+ * Update cached sensor data (rate-limited to 1 Hz).
+ * Caller must hold data->lock.
  */
 static int it5570_update(struct it5570_data *data)
 {
-	u8 hi, lo, duty, mode, temp;
+	u8 hi, hi2, lo, duty, mode, temp;
 	int ret;
 
-	mutex_lock(&data->lock);
+	lockdep_assert_held(&data->lock);
 
 	if (data->valid && time_before(jiffies, data->last_updated + HZ))
-		goto out;
+		return 0;
 
 	ret = ec_read_byte(EC_REG_FAN_RPM_HI, &hi);
 	if (ret)
@@ -262,6 +272,21 @@ static int it5570_update(struct it5570_data *data)
 	ret = ec_read_byte(EC_REG_FAN_RPM_LO, &lo);
 	if (ret)
 		goto err;
+	/*
+	 * hi/lo are two separate EC transactions; if the count crossed a
+	 * 256-count boundary in between, the pair is torn. Re-read hi and
+	 * retry lo once - a second consecutive tear is vanishingly rare
+	 * and costs one glitchy 1 Hz sample, not a control decision.
+	 */
+	ret = ec_read_byte(EC_REG_FAN_RPM_HI, &hi2);
+	if (ret)
+		goto err;
+	if (hi2 != hi) {
+		hi = hi2;
+		ret = ec_read_byte(EC_REG_FAN_RPM_LO, &lo);
+		if (ret)
+			goto err;
+	}
 	ret = ec_read_byte(EC_REG_FAN_DUTY, &duty);
 	if (ret)
 		goto err;
@@ -277,7 +302,13 @@ static int it5570_update(struct it5570_data *data)
 		data->fan_rpm = 0;	/* saturated tach: stopped/unplugged */
 	data->fan_duty = duty;
 	data->fan_mode = mode;
-	data->cpu_temp = temp;
+	if (temp == 0 || temp > EC_TEMP_MAX_C) {
+		pr_warn_ratelimited(DRIVER_NAME ": implausible CPU temp %u, keeping last value\n",
+				    temp);
+	} else {
+		data->cpu_temp = temp;
+		data->temp_valid = true;
+	}
 
 	if (mode < EC_FAN_MODE_MANUAL || mode > EC_FAN_MODE_FULL)
 		pr_warn_ratelimited(DRIVER_NAME ": unexpected fan mode %u\n",
@@ -285,14 +316,10 @@ static int it5570_update(struct it5570_data *data)
 
 	data->last_updated = jiffies;
 	data->valid = true;
-
-out:
-	mutex_unlock(&data->lock);
 	return 0;
 
 err:
 	data->valid = false;
-	mutex_unlock(&data->lock);
 	return ret;
 }
 
@@ -363,8 +390,8 @@ static int it5570_set_mode(struct it5570_data *data, unsigned int mode)
  * hwmon interface
  */
 static umode_t it5570_is_visible(const void *drvdata,
-				  enum hwmon_sensor_types type,
-				  u32 attr, int channel)
+				 enum hwmon_sensor_types type,
+				 u32 attr, int channel)
 {
 	switch (type) {
 	case hwmon_fan:
@@ -391,19 +418,21 @@ static umode_t it5570_is_visible(const void *drvdata,
 }
 
 static int it5570_read(struct device *dev, enum hwmon_sensor_types type,
-			u32 attr, int channel, long *val)
+		       u32 attr, int channel, long *val)
 {
 	struct it5570_data *data = dev_get_drvdata(dev);
 	int ret;
 
+	mutex_lock(&data->lock);
+
 	ret = it5570_update(data);
 	if (ret)
-		return ret;
+		goto out;
 
 	switch (type) {
 	case hwmon_fan:
 		*val = data->fan_rpm;
-		return 0;
+		break;
 
 	case hwmon_pwm:
 		switch (attr) {
@@ -418,7 +447,7 @@ static int it5570_read(struct device *dev, enum hwmon_sensor_types type,
 							     HWMON_PWM_MAX,
 							     EC_DUTY_MAX),
 					   (unsigned int)HWMON_PWM_MAX);
-			return 0;
+			break;
 		case hwmon_pwm_enable:
 			switch (data->fan_mode) {
 			case EC_FAN_MODE_AUTO:
@@ -431,19 +460,30 @@ static int it5570_read(struct device *dev, enum hwmon_sensor_types type,
 				*val = 1;
 				break;
 			}
-			return 0;
+			break;
 		default:
-			return -EOPNOTSUPP;
+			ret = -EOPNOTSUPP;
+			break;
 		}
+		break;
 
 	case hwmon_temp:
+		if (!data->temp_valid) {
+			ret = -EIO;	/* never seen a plausible sample */
+			break;
+		}
 		/* hwmon temperatures are in millidegrees C */
 		*val = data->cpu_temp * 1000;
-		return 0;
+		break;
 
 	default:
-		return -EOPNOTSUPP;
+		ret = -EOPNOTSUPP;
+		break;
 	}
+
+out:
+	mutex_unlock(&data->lock);
+	return ret;
 }
 
 static int it5570_read_string(struct device *dev, enum hwmon_sensor_types type,
@@ -457,7 +497,7 @@ static int it5570_read_string(struct device *dev, enum hwmon_sensor_types type,
 }
 
 static int it5570_write(struct device *dev, enum hwmon_sensor_types type,
-			 u32 attr, int channel, long val)
+			u32 attr, int channel, long val)
 {
 	struct it5570_data *data = dev_get_drvdata(dev);
 	unsigned int duty;
@@ -466,18 +506,22 @@ static int it5570_write(struct device *dev, enum hwmon_sensor_types type,
 	if (type != hwmon_pwm)
 		return -EOPNOTSUPP;
 
+	mutex_lock(&data->lock);
+
+	if (data->shutting_down) {
+		mutex_unlock(&data->lock);
+		return -EBUSY;
+	}
+
 	switch (attr) {
 	case hwmon_pwm_input:
 		/* Convert hwmon 0-255 to EC percent; never switches modes */
-		val = clamp_val(val, 0, HWMON_PWM_MAX);
-		val = DIV_ROUND_CLOSEST(val * EC_DUTY_MAX, HWMON_PWM_MAX);
-		mutex_lock(&data->lock);
-		ret = it5570_write_duty(data, val);
-		mutex_unlock(&data->lock);
-		return ret;
+		duty = clamp_val(val, 0, HWMON_PWM_MAX);
+		duty = DIV_ROUND_CLOSEST(duty * EC_DUTY_MAX, HWMON_PWM_MAX);
+		ret = it5570_write_duty(data, duty);
+		break;
 
 	case hwmon_pwm_enable:
-		mutex_lock(&data->lock);
 		switch (val) {
 		case 0:	/* hwmon convention: full speed */
 			ret = it5570_set_mode(data, EC_FAN_MODE_FULL);
@@ -495,12 +539,15 @@ static int it5570_write(struct device *dev, enum hwmon_sensor_types type,
 			ret = -EINVAL;
 			break;
 		}
-		mutex_unlock(&data->lock);
-		return ret;
+		break;
 
 	default:
-		return -EOPNOTSUPP;
+		ret = -EOPNOTSUPP;
+		break;
 	}
+
+	mutex_unlock(&data->lock);
+	return ret;
 }
 
 static const struct hwmon_channel_info * const it5570_info[] = {
@@ -561,27 +608,30 @@ static int it5570_probe(struct platform_device *pdev)
 	mutex_init(&data->lock);
 
 	ret = devm_add_action_or_reset(&pdev->dev, it5570_restore_auto_action,
-					data);
+				       data);
 	if (ret)
 		return ret;
 
-	hwmon_dev = devm_hwmon_device_register_with_info(
-		&pdev->dev, DRIVER_NAME, data,
-		&it5570_chip_info, NULL);
+	hwmon_dev = devm_hwmon_device_register_with_info(&pdev->dev,
+							 DRIVER_NAME, data,
+							 &it5570_chip_info,
+							 NULL);
 	if (IS_ERR(hwmon_dev))
 		return PTR_ERR(hwmon_dev);
 
 	platform_set_drvdata(pdev, data);
 
-	/* Initial read */
+	/* Initial read; hwmon sysfs is already live, so snapshot under lock */
+	mutex_lock(&data->lock);
 	ret = it5570_update(data);
-	if (ret)
-		dev_warn(&pdev->dev, "initial EC read failed (%d)\n", ret);
-	else
+	if (ret == 0 && data->temp_valid)
 		dev_info(&pdev->dev,
 			 "CPU: %u°C, fan: %u RPM (%u%% duty, mode %u)\n",
 			 data->cpu_temp, data->fan_rpm, data->fan_duty,
 			 data->fan_mode);
+	mutex_unlock(&data->lock);
+	if (ret)
+		dev_warn(&pdev->dev, "initial EC read failed (%d)\n", ret);
 
 	return 0;
 }
@@ -599,6 +649,7 @@ static void it5570_shutdown(struct platform_device *pdev)
 	int ret;
 
 	mutex_lock(&data->lock);
+	data->shutting_down = true;
 	ret = ec_write_byte(EC_REG_FAN_MODE, EC_FAN_MODE_AUTO);
 	mutex_unlock(&data->lock);
 	if (ret)
@@ -691,25 +742,50 @@ static int __init it5570_init(void)
 	if (ret)
 		return ret;
 
+	/*
+	 * Hold the EC ports for the driver's lifetime so no other
+	 * port-banging driver can interleave with our multi-step EC
+	 * transactions. The ACPI EC driver never binds here (_STA=0),
+	 * so the ports are unclaimed. Not adjacent - two regions.
+	 */
+	if (!request_region(EC_DATA, 1, DRIVER_NAME)) {
+		pr_err(DRIVER_NAME ": EC data port 0x%02x busy\n", EC_DATA);
+		return -EBUSY;
+	}
+	if (!request_region(EC_SC, 1, DRIVER_NAME)) {
+		pr_err(DRIVER_NAME ": EC command port 0x%02x busy\n", EC_SC);
+		ret = -EBUSY;
+		goto err_release_data;
+	}
+
 	ret = platform_driver_register(&it5570_driver);
 	if (ret)
-		return ret;
+		goto err_release_sc;
 
 	it5570_pdev = platform_device_register_simple(DRIVER_NAME, -1,
-						       NULL, 0);
+						      NULL, 0);
 	if (IS_ERR(it5570_pdev)) {
 		ret = PTR_ERR(it5570_pdev);
-		platform_driver_unregister(&it5570_driver);
-		return ret;
+		goto err_driver;
 	}
 
 	return 0;
+
+err_driver:
+	platform_driver_unregister(&it5570_driver);
+err_release_sc:
+	release_region(EC_SC, 1);
+err_release_data:
+	release_region(EC_DATA, 1);
+	return ret;
 }
 
 static void __exit it5570_exit(void)
 {
 	platform_device_unregister(it5570_pdev);
 	platform_driver_unregister(&it5570_driver);
+	release_region(EC_SC, 1);
+	release_region(EC_DATA, 1);
 }
 
 module_init(it5570_init);

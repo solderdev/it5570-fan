@@ -222,7 +222,7 @@ This section describes how the upstream project found *its* register map — it 
 | `pwm1` | Fan duty, scaled 0–255 from the EC's native 0–100 % (`pwm1 = round(EC% * 255 / 100)`). While `pwm1_enable=2` (auto), reports the *last commanded* manual duty rather than the EC auto curve's live output — the EC exposes no readback of what the curve is currently doing. |
 | `pwm1_enable` | `0` = full speed (EC mode 3) · `1` = manual (EC mode 1) · `2` = EC automatic curve (EC mode 2, default) |
 
-**10 % manual-duty floor:** the driver clamps every manual-mode duty write to a 10–100 % range, so `pwm1` values 1–25 are accepted but round-trip up to 26 on readback (`round(10% * 255 / 100) = 26`) — values 1–25 are simply unreachable when reading `pwm1` back. If you run `pwmconfig` against this driver, it will find the fan never fully stops and will record `MINPWM` around 26 instead of 0 — that's the floor working as intended, not a bug.
+**10 % manual-duty floor:** the driver clamps every manual-mode duty write to a 10–100 % range — deliberately deviating from the hwmon convention that `pwm1 = 0` means "fan off". Writing `pwm1 = 0` does **not** stop the fan: it lands at the 10 % floor like every other value below 26, so `pwm1` values 0–25 are accepted but round-trip up to 26 on readback (`round(10% * 255 / 100) = 26`) and are unreachable when reading back. Consequences for tooling: a fan-curve app (e.g. coolercontrol) with a 0 % point keeps the fan spinning at 10 % duty there, and `pwmconfig` will find the fan never fully stops and record `MINPWM` around 26 instead of 0 — that's the floor working as intended, not a bug.
 
 ## Contributing
 
