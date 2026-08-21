@@ -510,7 +510,7 @@ static int it5570_write(struct device *dev, enum hwmon_sensor_types type,
 
 	if (data->shutting_down) {
 		mutex_unlock(&data->lock);
-		return -EBUSY;
+		return -ENODEV;
 	}
 
 	switch (attr) {
