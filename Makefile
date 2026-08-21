@@ -6,7 +6,12 @@ BUILD := $(CURDIR)/build
 # builds. Detect that from the kernel's .config; on GCC kernels nothing extra
 # is passed. Explicit CC=/LD=/LLVM= on the command line still override.
 LLVM ?= $(shell grep -qs '^CONFIG_CC_IS_CLANG=y' $(KDIR)/.config && echo 1)
-KBUILD_ARGS := $(if $(CC),CC=$(CC)) $(if $(LD),LD=$(LD)) $(if $(LLVM),LLVM=$(LLVM))
+# make has built-in defaults CC=cc and LD=ld; forward them only when the
+# user actually set them (command line or environment), or they would
+# override the kernel Makefile's own toolchain choice under LLVM=1.
+KBUILD_ARGS := $(if $(filter-out default undefined,$(origin CC)),CC=$(CC)) \
+               $(if $(filter-out default undefined,$(origin LD)),LD=$(LD)) \
+               $(if $(LLVM),LLVM=$(LLVM))
 
 .DEFAULT_GOAL := help
 
