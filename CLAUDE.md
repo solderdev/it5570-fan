@@ -42,8 +42,15 @@ and refuses to bind on the upstream hardware.
 - Packaging is out of scope: no AUR/PKGBUILD. Supported install path:
   clone → `make dkms-install` (DKMS registration, module install,
   modules-load.d autoload).
-- Open: how the fan should ultimately be controlled is undecided —
-  brainstorm the approach in a future session before picking any tool.
+- Fan control: the persistent EC auto curve is the full solution — no
+  fancontrol/thinkfan/daemon. The firmware's thermal-emergency branch
+  only runs in auto mode, so a manual-mode daemon is strictly less
+  safe; the SSD sits outside the CPU fan's airflow, so non-CPU temp
+  sources are irrelevant.
+- Open: curve settings revert every boot (BIOS rewrites EC 0x28-0x2B).
+  Planned fix in its own session: expose them as hwmon
+  pwm1_auto_point* attributes in it5570_fan.c plus a boot one-shot —
+  replaces the /dev/port stopgap that races the driver's EC mutex.
 
 ## Workflow
 
