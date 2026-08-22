@@ -153,7 +153,7 @@ T <  [0x2A] - 5    ->  target = 0        # 5 °C hysteresis
 
 The target is in units of 1/255, then scaled by the PWM period register and written to the duty register. Notes for anyone tuning these bytes:
 
-- **0x28 is a multiplier, not a divisor**: duty steps out of 255 per °C. BIOS stores its dropdown's list index rather than the label shown (label 1 → byte 3, label 2 → byte 4), and the firmware uses that byte raw, so the numbers in BIOS setup do not describe the resulting slope.
+- **0x28 is a multiplier, not a divisor**: duty steps out of 255 per °C. BIOS does not store the label shown (label 1 → byte 3, label 2 → byte 4 — consistent with the dropdown's list index, though only these two data points exist), and the firmware uses that byte raw, so the numbers in BIOS setup do not describe the resulting slope.
 - **0x29 is in 1/255 units, not percent** (unlike the manual-duty byte 0x2D).
 - The forced-full-speed branch at `T >= [0x2B]` bypasses the ramp limiter entirely. Since the temperature is capped at 100 °C, setting 0x2B above 100 disables that branch permanently rather than merely raising it.
 - Between targets the duty register moves by **±1 step per tick (~2 Hz)**, so a full 0→255 sweep takes ~125 s. From a standstill the firmware instead kicks the duty straight to 0x29.
@@ -181,7 +181,7 @@ The fan routine at file offset **0xA7AB** dispatches on EC offset 0x23:
 
 Crucially, the firmware **only ever reads** offsets 0x23 and 0x2D — it never writes them. They are host-input fields, so this is an intended control path rather than a side effect.
 
-The host cannot reach 0x1841 (or any other EC SRAM outside the window): the cmd-0x81 write handler at 0xCAF2 loads the host-supplied offset into `DPL` and hard-codes `DPH` to 0x04, so every host transaction is confined to page 0x04.
+The host cannot reach 0x1841: the cmd-0x81 write handler at 0xCAF2 loads the host-supplied offset into `DPL` and hard-codes `DPH` to 0x04, confining host writes to page 0x04 (the only exceptions are two special-cased offsets, EC 0xF3 → SRAM 0x2280 and 0xF6 → 0x2281, neither anywhere near the PWM registers).
 
 To control the fan: write the duty percent to **0x2D**, then write **1** to **0x23**. Write **2** to 0x23 to hand control back to the EC's automatic curve. Mode 3 forces 100 %.
 
