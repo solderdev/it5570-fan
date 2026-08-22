@@ -103,7 +103,9 @@ echo 2 | sudo tee /sys/class/hwmon/hwmon*/pwm1_enable
 
 ### Thermal safety
 
-Manual mode (`pwm1_enable=1`) hands duty control to the host. Whether the EC firmware still applies its own thermal override underneath manual mode (e.g. forcing full speed past some temperature) has not been established through reverse engineering — treat host-side thermal management (e.g. a fan curve daemon) as load-bearing when using manual mode, with CPU self-throttling as the last-resort backstop if you don't set one up.
+Manual mode (`pwm1_enable=1`) hands duty control to the host, and the EC applies **no thermal override underneath it** — this has now been established by disassembly. The mode dispatch at 0xA7F5 enters the curve block only when 0x23 = 2, so in manual mode the `T >= [0x2B]` forced-full-speed branch never executes. That branch is the firmware's *only* thermal-emergency path, and there is no fan-stall or fan-failure handling anywhere either: if the tachometer reads zero the firmware publishes 0 RPM and nothing reacts.
+
+Treat host-side thermal management (e.g. a fan curve daemon) as load-bearing whenever you use manual mode, with CPU self-throttling at Tjmax as the last-resort backstop if you don't set one up.
 
 The driver limits how bad a hung or crashed fan controller can get:
 - Manual duty is floored at 10 % (see "hwmon sysfs interface" below) — it can never command the fan fully off.
@@ -128,14 +130,34 @@ Reads were confirmed by sampling all 256 EC bytes at 1 Hz through an idle → 8-
 | Offset | R/W | Description |
 |---|---|---|
 | 0x2E/0x2F | R | CPU fan RPM, 16-bit **big-endian** (~1200 idle → ~3000 load); mirrored at 0x76/0x77 |
-| 0x70 | R | CPU temperature, °C (r=+0.94 vs coretemp) |
-| 0x96/0x97 | R | CPU temperature, 0.1 °C units, 16-bit **little-endian** (r=+0.95) |
+| 0x70 | R | CPU temperature, °C (r=+0.94 vs coretemp) — a verbatim copy of EC SRAM 0x9608, written at the top of every fan tick (`[0x0470] = [0x9608]`, 0xA7BF), so it is exactly the value the auto curve compares against and it refreshes at the fan tick rate |
+| 0x96/0x97 | R | The same temperature ×10, 16-bit **little-endian** — computed as `[0x9608] * 10` (0xE96B). Despite the 0.1 °C units it carries **no extra precision**; it is the same integer °C as 0x70 |
 | 0x60 | R | Slow-moving temperature, °C — board temp candidate |
 | 0x23 | **R/W** | **Fan mode: 0 = off, 1 = manual, 2 = auto curve (default), 3 = full speed** |
 | 0x2D | **R/W** | **Manual duty in percent (0–100), applied when mode = 1. Defaults to 0** |
-| 0x28–0x2B | R/W | Auto-curve parameters: slope divisor, base duty %, low temp, high temp |
+| 0x28–0x2B | **R/W** | **Auto-curve parameters — the four fan settings exposed in BIOS setup:** 0x28 slope, 0x29 start duty, 0x2A start temperature, 0x2B full-speed temperature. See ["The EC auto curve"](#the-ec-auto-curve-offsets-0x280x2b) |
 
-Auto-curve defaults differ between EC firmware revisions (V1.02: 0x28=3, 0x29=40, 0x2A=30, 0x2B=80), so treat them as tunables rather than constants.
+The EC's temperature source is the CPU's own PECI/DTS reading, computed at 0xE1A6 as `100 − DTS_margin`. It is therefore **capped at 100 °C** and lags on fast transients (EC 53 °C has been observed while `coretemp` read 84 °C mid-burst); in steady state it reads a few °C above package temperature.
+
+Auto-curve values are provisioned by BIOS at every boot and differ between EC firmware revisions (V1.02 defaults: 0x28=3, 0x29=40, 0x2A=30, 0x2B=80), so treat them as tunables rather than constants. The firmware only ever reads them, so host writes persist until the next boot.
+
+### The EC auto curve (offsets 0x28–0x2B)
+
+With mode 2 selected, the routine at 0xA7AB computes a target duty from the temperature `T` at 0x9608:
+
+```
+T >= [0x2B]        ->  target = 255      # forced full speed, written directly
+T >= [0x2A]        ->  target = [0x29] + (T - [0x2A]) * [0x28]
+T <  [0x2A] - 5    ->  target = 0        # 5 °C hysteresis
+```
+
+The target is in units of 1/255, then scaled by the PWM period register and written to the duty register. Notes for anyone tuning these bytes:
+
+- **0x28 is a multiplier, not a divisor**: duty steps out of 255 per °C. BIOS stores its dropdown's list index rather than the label shown (label 1 → byte 3, label 2 → byte 4), and the firmware uses that byte raw, so the numbers in BIOS setup do not describe the resulting slope.
+- **0x29 is in 1/255 units, not percent** (unlike the manual-duty byte 0x2D).
+- The forced-full-speed branch at `T >= [0x2B]` bypasses the ramp limiter entirely. Since the temperature is capped at 100 °C, setting 0x2B above 100 disables that branch permanently rather than merely raising it.
+- Between targets the duty register moves by **±1 step per tick (~2 Hz)**, so a full 0→255 sweep takes ~125 s. From a standstill the firmware instead kicks the duty straight to 0x29.
+- **The target is stored as 8 bits with no clamp** (0xA852 keeps only the low byte). If `[0x29] + (T − [0x2A]) × [0x28]` exceeds 255 it wraps modulo 256 and *the fan slows down as the CPU gets hotter*. Keep `[0x29] + (100 − [0x2A]) × [0x28] <= 255`. Note BIOS itself can violate this: its own defaults with the slope dropdown at "8" reach 273 at 74 °C.
 
 ### Fan control interface (recovered from firmware disassembly)
 
@@ -158,6 +180,8 @@ The fan routine at file offset **0xA7AB** dispatches on EC offset 0x23:
 ```
 
 Crucially, the firmware **only ever reads** offsets 0x23 and 0x2D — it never writes them. They are host-input fields, so this is an intended control path rather than a side effect.
+
+The host cannot reach 0x1841 (or any other EC SRAM outside the window): the cmd-0x81 write handler at 0xCAF2 loads the host-supplied offset into `DPL` and hard-codes `DPH` to 0x04, so every host transaction is confined to page 0x04.
 
 To control the fan: write the duty percent to **0x2D**, then write **1** to **0x23**. Write **2** to 0x23 to hand control back to the EC's automatic curve. Mode 3 forces 100 %.
 
