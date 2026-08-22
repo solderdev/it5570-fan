@@ -9,7 +9,7 @@ This fork is **LattePanda Sigma-only**: the probe is gated on a DMI match (`Latt
 - Fan RPM monitoring (one fan)
 - PWM fan speed control — manual duty, full speed, and the EC's automatic curve
 - One CPU temperature sensor
-- Works with [coolercontrol](https://gitlab.com/coolercontrol/coolercontrol) for custom fan curves
+- Standard hwmon sysfs interface, usable by any fan-control tool
 - DKMS support — auto-rebuilds on kernel updates
 - Restores automatic EC fan control on module unload, and hands control back to the EC across suspend/resume
 
@@ -110,10 +110,6 @@ Treat host-side thermal management (e.g. a fan curve daemon) as load-bearing whe
 The driver limits how bad a hung or crashed fan controller can get:
 - Manual duty is floored at 10 % (see "hwmon sysfs interface" below) — it can never command the fan fully off.
 - Fan control reverts to the EC's automatic curve when the module is unloaded, when the system suspends, and on shutdown/reboot; on resume, the manual/full state active before suspend is re-applied.
-
-### coolercontrol
-
-Install [coolercontrol](https://gitlab.com/coolercontrol/coolercontrol) and it will automatically detect the hwmon interface. You can then create a custom fan curve using the CPU temperature sensor as input.
 
 ## Reverse engineering the Sigma EC
 
@@ -233,7 +229,7 @@ This section describes how the upstream project found *its* register map — the
 | `pwm1` | Fan duty, scaled 0–255 from the EC's native 0–100 % (`pwm1 = round(EC% * 255 / 100)`). While `pwm1_enable=2` (auto), reports the *last commanded* manual duty rather than the EC auto curve's live output — the EC exposes no readback of what the curve is currently doing. |
 | `pwm1_enable` | `0` = full speed (EC mode 3) · `1` = manual (EC mode 1) · `2` = EC automatic curve (EC mode 2, default) |
 
-**10 % manual-duty floor:** the driver clamps every manual-mode duty write to a 10–100 % range — deliberately deviating from the hwmon convention that `pwm1 = 0` means "fan off". Writing `pwm1 = 0` does **not** stop the fan: it lands at the 10 % floor like every other value below 26, so `pwm1` values 0–25 are accepted but round-trip up to 26 on readback (`round(10% * 255 / 100) = 26`). Consequences for tooling: a fan-curve app (e.g. coolercontrol) with a 0 % point keeps the fan spinning at 10 % duty there, and `pwmconfig` will find the fan never fully stops and record `MINPWM` around 26 instead of 0 — that's the floor working as intended, not a bug.
+**10 % manual-duty floor:** the driver clamps every manual-mode duty write to a 10–100 % range — deliberately deviating from the hwmon convention that `pwm1 = 0` means "fan off". Writing `pwm1 = 0` does **not** stop the fan: it lands at the 10 % floor like every other value below 26, so `pwm1` values 0–25 are accepted but round-trip up to 26 on readback (`round(10% * 255 / 100) = 26`). Consequences for tooling: a fan-curve app with a 0 % point keeps the fan spinning at 10 % duty there, and `pwmconfig` will find the fan never fully stops and record `MINPWM` around 26 instead of 0 — that's the floor working as intended, not a bug.
 
 ## Contributing
 

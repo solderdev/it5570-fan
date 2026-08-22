@@ -41,8 +41,9 @@ and refuses to bind on the upstream hardware.
   driver bug — don't debug it as one.
 - Packaging is out of scope: no AUR/PKGBUILD. Supported install path:
   clone → `make dkms-install` (DKMS registration, module install,
-  modules-load.d autoload) → configure a fan app such as coolercontrol.
-- Open: coolercontrol setup.
+  modules-load.d autoload).
+- Open: how the fan should ultimately be controlled is undecided —
+  brainstorm the approach in a future session before picking any tool.
 
 ## Workflow
 
