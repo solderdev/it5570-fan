@@ -44,6 +44,7 @@
 #include <linux/platform_device.h>
 #include <linux/dmi.h>
 #include <linux/pm.h>
+#include <linux/hwmon-sysfs.h>
 
 #define DRIVER_NAME	"it5570_fan"
 
@@ -73,6 +74,19 @@
 #define EC_REG_FAN_RPM_LO	0x2F
 #define EC_REG_CPU_TEMP		0x70	/* °C */
 
+/*
+ * EC auto-curve parameters (BIOS rewrites these on every boot; the
+ * firmware only reads them, so host writes persist until then).
+ * duty/255 = start_pwm + (T - start_temp) * slope, jumping to 255 at
+ * full_temp; full_temp > 100 is unreachable (EC temp saturates at 100)
+ * and turns the jump - the firmware's only thermal-emergency path -
+ * into a cap on the curve instead.
+ */
+#define EC_REG_CURVE_SLOPE	0x28	/* duty steps (/255) per °C, raw multiplier */
+#define EC_REG_CURVE_START_PWM	0x29	/* duty (/255) at start_temp */
+#define EC_REG_CURVE_START_TEMP	0x2A	/* °C where the curve engages */
+#define EC_REG_CURVE_FULL_TEMP	0x2B	/* °C where duty jumps to 255 */
+
 /* Fan mode register values */
 #define EC_FAN_MODE_OFF		0	/* comparison only — NEVER written */
 #define EC_FAN_MODE_MANUAL	1
@@ -86,6 +100,33 @@
 #define EC_TEMP_MAX_C		120	/* plausibility ceiling; above = EC read glitch */
 #define HWMON_PWM_MAX		255
 
+/*
+ * Curve validation: the firmware keeps only the low byte of the curve
+ * target, so a target > 255 wraps mod 256 and the fan SLOWS DOWN as the
+ * CPU heats. The EC temperature saturates at EC_CURVE_TEMP_CAP, which
+ * bounds the reachable part of the curve.
+ */
+#define EC_CURVE_TEMP_CAP	100	/* °C; EC temp = 100 - DTS margin */
+/*
+ * EC_DUTY_MIN in /255 units (= 26): floors the curve's *engaged* duty.
+ * Below start_temp - 5 the firmware still parks the fan at 0 by design.
+ */
+#define EC_CURVE_PWM_FLOOR	DIV_ROUND_UP(EC_DUTY_MIN * HWMON_PWM_MAX, \
+					     EC_DUTY_MAX)
+
+enum {
+	CURVE_SLOPE,
+	CURVE_START_PWM,
+	CURVE_START_TEMP,
+	CURVE_FULL_TEMP,
+	EC_CURVE_NREGS
+};
+
+static const u8 it5570_curve_regs[EC_CURVE_NREGS] = {
+	EC_REG_CURVE_SLOPE, EC_REG_CURVE_START_PWM,
+	EC_REG_CURVE_START_TEMP, EC_REG_CURVE_FULL_TEMP,
+};
+
 struct it5570_data {
 	struct mutex lock;	/* guards cached fields and cache->EC-write ordering */
 	unsigned long last_updated;
@@ -98,6 +139,12 @@ struct it5570_data {
 	unsigned int fan_duty;	/* 0-100, cached 0x2D */
 	unsigned int fan_mode;	/* cached 0x23 */
 	unsigned int cpu_temp;	/* °C */
+
+	/* EC auto-curve staging (offsets 0x28-0x2B) */
+	u8 curve_staged[EC_CURVE_NREGS];	/* sysfs-visible values */
+	u8 curve_ec[EC_CURVE_NREGS];	/* last curve known to be in the EC */
+	u8 curve_written;	/* bitmask: staged slot written since load */
+	bool curve_valid;	/* curve_ec reflects the EC */
 };
 
 static struct platform_device *it5570_pdev;
@@ -387,6 +434,239 @@ static int it5570_set_mode(struct it5570_data *data, unsigned int mode)
 }
 
 /*
+ * EC auto-curve helpers. All require data->lock held (same nesting as
+ * the fan-control helpers: data->lock -> ec_io_mutex).
+ */
+
+/*
+ * Read EC 0x28-0x2B into the last-known copy, and into every staged
+ * slot too unless keep_staged is set, in which case slots the user has
+ * written since load are preserved.
+ */
+static int it5570_curve_refresh(struct it5570_data *data, bool keep_staged)
+{
+	u8 vals[EC_CURVE_NREGS];
+	int i, ret;
+
+	lockdep_assert_held(&data->lock);
+
+	for (i = 0; i < EC_CURVE_NREGS; i++) {
+		ret = ec_read_byte(it5570_curve_regs[i], &vals[i]);
+		if (ret)
+			return ret;
+	}
+	for (i = 0; i < EC_CURVE_NREGS; i++) {
+		data->curve_ec[i] = vals[i];
+		if (!keep_staged || !(data->curve_written & BIT(i)))
+			data->curve_staged[i] = vals[i];
+	}
+	if (!keep_staged)
+		data->curve_written = 0;
+	data->curve_valid = true;
+	return 0;
+}
+
+/*
+ * Validate a curve 4-tuple; logs the rejection reason ("what" names the
+ * caller for the log). start_pwm is floored like manual duty: without
+ * it, a curve such as slope=0/start_pwm=0 would hold the fan off at
+ * 100 °C with the emergency branch disabled (full_temp > 100).
+ */
+static bool it5570_curve_check(const u8 *curve, const char *what)
+{
+	int ceiling = min((int)curve[CURVE_FULL_TEMP] - 1, EC_CURVE_TEMP_CAP);
+	int peak = curve[CURVE_START_PWM] +
+		   max(0, ceiling - (int)curve[CURVE_START_TEMP]) *
+		   curve[CURVE_SLOPE];
+
+	if (curve[CURVE_START_PWM] < EC_CURVE_PWM_FLOOR) {
+		pr_warn(DRIVER_NAME ": %s: start_pwm %u below floor %u (10%% duty)\n",
+			what, curve[CURVE_START_PWM], EC_CURVE_PWM_FLOOR);
+		return false;
+	}
+	if (curve[CURVE_START_TEMP] > EC_CURVE_TEMP_CAP) {
+		pr_warn(DRIVER_NAME ": %s: start_temp %u above the %u °C EC ceiling - the fan would never start\n",
+			what, curve[CURVE_START_TEMP], EC_CURVE_TEMP_CAP);
+		return false;
+	}
+	if (peak > 255) {
+		pr_warn(DRIVER_NAME ": %s: curve target reaches %d (>255) at %d °C and would wrap - the fan would slow down when hot\n",
+			what, peak, ceiling);
+		return false;
+	}
+	return true;
+}
+
+/*
+ * Write a validated curve to the EC with per-byte read-back. On any
+ * failure the last-known curve is rewritten: a half-applied mix of two
+ * individually valid curves can itself violate the overflow invariant.
+ * "curve" must not alias data->curve_ec (rollback source).
+ */
+static int it5570_curve_apply(struct it5570_data *data, const u8 *curve)
+{
+	int i, ret = 0;
+	u8 rb;
+
+	lockdep_assert_held(&data->lock);
+
+	for (i = 0; i < EC_CURVE_NREGS; i++) {
+		ret = ec_write_byte(it5570_curve_regs[i], curve[i]);
+		if (!ret) {
+			ret = ec_read_byte(it5570_curve_regs[i], &rb);
+			if (!ret && rb != curve[i])
+				ret = -EIO;
+		}
+		if (ret)
+			break;
+	}
+	if (ret) {
+		bool rb_failed = false;
+
+		for (i = 0; i < EC_CURVE_NREGS; i++)
+			if (ec_write_byte(it5570_curve_regs[i],
+					  data->curve_ec[i]))
+				rb_failed = true;
+		if (rb_failed) {
+			pr_err(DRIVER_NAME ": curve write failed (%d) and rollback failed - EC curve state unknown\n",
+			       ret);
+			data->curve_valid = false;
+			data->valid = false;
+		} else {
+			pr_warn(DRIVER_NAME ": curve write failed (%d), previous curve restored\n",
+				ret);
+		}
+		return ret;
+	}
+
+	memcpy(data->curve_ec, curve, EC_CURVE_NREGS);
+	data->curve_valid = true;
+	pr_info(DRIVER_NAME ": applied fan curve: slope=%u start_pwm=%u start_temp=%u full_temp=%u\n",
+		curve[CURVE_SLOPE], curve[CURVE_START_PWM],
+		curve[CURVE_START_TEMP], curve[CURVE_FULL_TEMP]);
+	return 0;
+}
+
+/*
+ * Sysfs curve interface: the four value attrs read/write a staged
+ * buffer only; curve_commit=1 validates and applies the whole 4-tuple
+ * atomically, curve_commit=0 re-reads the EC (race-free live view,
+ * discarding staged edits). Reading curve_commit returns the dirty flag.
+ */
+static ssize_t curve_val_show(struct device *dev,
+			      struct device_attribute *attr, char *buf)
+{
+	struct it5570_data *data = dev_get_drvdata(dev);
+	int idx = to_sensor_dev_attr(attr)->index;
+	u8 val;
+
+	mutex_lock(&data->lock);
+	val = data->curve_staged[idx];
+	mutex_unlock(&data->lock);
+	return sysfs_emit(buf, "%u\n", val);
+}
+
+static ssize_t curve_val_store(struct device *dev,
+			       struct device_attribute *attr,
+			       const char *buf, size_t count)
+{
+	struct it5570_data *data = dev_get_drvdata(dev);
+	int idx = to_sensor_dev_attr(attr)->index;
+	unsigned int val;
+	int ret;
+
+	ret = kstrtouint(buf, 0, &val);
+	if (ret)
+		return ret;
+	if (val > 255)
+		return -EINVAL;
+
+	mutex_lock(&data->lock);
+	if (data->shutting_down) {
+		mutex_unlock(&data->lock);
+		return -ENODEV;
+	}
+	data->curve_staged[idx] = val;
+	data->curve_written |= BIT(idx);
+	mutex_unlock(&data->lock);
+	return count;
+}
+
+static ssize_t curve_commit_show(struct device *dev,
+				 struct device_attribute *attr, char *buf)
+{
+	struct it5570_data *data = dev_get_drvdata(dev);
+	bool dirty;
+
+	mutex_lock(&data->lock);
+	dirty = !data->curve_valid ||
+		memcmp(data->curve_staged, data->curve_ec, EC_CURVE_NREGS);
+	mutex_unlock(&data->lock);
+	return sysfs_emit(buf, "%u\n", dirty);
+}
+
+static ssize_t curve_commit_store(struct device *dev,
+				  struct device_attribute *attr,
+				  const char *buf, size_t count)
+{
+	struct it5570_data *data = dev_get_drvdata(dev);
+	unsigned int val;
+	int ret;
+
+	ret = kstrtouint(buf, 0, &val);
+	if (ret)
+		return ret;
+	if (val > 1)
+		return -EINVAL;
+
+	mutex_lock(&data->lock);
+	if (data->shutting_down) {
+		ret = -ENODEV;
+		goto out;
+	}
+	if (val == 0) {
+		ret = it5570_curve_refresh(data, false);
+		goto out;
+	}
+	/*
+	 * Never validate or apply against unknown EC state: a bare commit
+	 * over zeroed buffers would e.g. write full_temp=0 (permanent full
+	 * speed). Re-read first, keeping the user's staged writes.
+	 */
+	if (!data->curve_valid) {
+		ret = it5570_curve_refresh(data, true);
+		if (ret)
+			goto out;
+	}
+	if (!it5570_curve_check(data->curve_staged, "curve_commit")) {
+		ret = -EINVAL;
+		goto out;
+	}
+	ret = it5570_curve_apply(data, data->curve_staged);
+	if (ret == 0)
+		data->curve_written = 0;
+out:
+	mutex_unlock(&data->lock);
+	return ret ? ret : count;
+}
+
+static SENSOR_DEVICE_ATTR_RW(curve_slope, curve_val, CURVE_SLOPE);
+static SENSOR_DEVICE_ATTR_RW(curve_start_pwm, curve_val, CURVE_START_PWM);
+static SENSOR_DEVICE_ATTR_RW(curve_start_temp, curve_val, CURVE_START_TEMP);
+static SENSOR_DEVICE_ATTR_RW(curve_full_temp, curve_val, CURVE_FULL_TEMP);
+static DEVICE_ATTR_RW(curve_commit);
+
+static struct attribute *it5570_curve_attrs[] = {
+	&sensor_dev_attr_curve_slope.dev_attr.attr,
+	&sensor_dev_attr_curve_start_pwm.dev_attr.attr,
+	&sensor_dev_attr_curve_start_temp.dev_attr.attr,
+	&sensor_dev_attr_curve_full_temp.dev_attr.attr,
+	&dev_attr_curve_commit.attr,
+	NULL
+};
+ATTRIBUTE_GROUPS(it5570_curve);
+
+/*
  * hwmon interface
  */
 static umode_t it5570_is_visible(const void *drvdata,
@@ -612,10 +892,21 @@ static int it5570_probe(struct platform_device *pdev)
 	if (ret)
 		return ret;
 
+	/*
+	 * Snapshot the EC curve before hwmon registration puts the curve
+	 * sysfs attrs live. Failure is non-fatal: curve_valid stays false
+	 * and curve_commit re-reads on first use.
+	 */
+	mutex_lock(&data->lock);
+	ret = it5570_curve_refresh(data, false);
+	mutex_unlock(&data->lock);
+	if (ret)
+		dev_warn(&pdev->dev, "initial curve read failed (%d)\n", ret);
+
 	hwmon_dev = devm_hwmon_device_register_with_info(&pdev->dev,
 							 DRIVER_NAME, data,
 							 &it5570_chip_info,
-							 NULL);
+							 it5570_curve_groups);
 	if (IS_ERR(hwmon_dev))
 		return PTR_ERR(hwmon_dev);
 
