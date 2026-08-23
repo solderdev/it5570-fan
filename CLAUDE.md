@@ -47,10 +47,13 @@ and refuses to bind on the upstream hardware.
   only runs in auto mode, so a manual-mode daemon is strictly less
   safe; the SSD sits outside the CPU fan's airflow, so non-CPU temp
   sources are irrelevant.
-- Open: curve settings revert every boot (BIOS rewrites EC 0x28-0x2B).
-  Planned fix in its own session: expose them as hwmon
-  pwm1_auto_point* attributes in it5570_fan.c plus a boot one-shot —
-  replaces the /dev/port stopgap that races the driver's EC mutex.
+- Curve persistence: solved. Module params (curve_slope, curve_start_pwm,
+  curve_start_temp, curve_full_temp; /etc/modprobe.d/it5570_fan-curve.conf,
+  template ships via dkms-install) re-apply the curve at probe and resume;
+  sysfs curve_* attrs + curve_commit give staged live tuning. Both paths
+  enforce start_pwm >= 26 and the byte-overflow invariant. curveset.py in
+  ../ec_dumps/ is RE tooling only - never run it while the module is
+  loaded (raw port I/O races the driver; curve_commit=0 is the live view).
 
 ## Workflow
 

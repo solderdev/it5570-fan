@@ -101,6 +101,46 @@ echo 128 | sudo tee /sys/class/hwmon/hwmon*/pwm1
 echo 2 | sudo tee /sys/class/hwmon/hwmon*/pwm1_enable
 ```
 
+### Tuning the auto curve
+
+The EC's automatic curve (`pwm1_enable=2`, the default and recommended mode) is tunable through four driver attributes — the same four values as the BIOS fan setup, live and scriptable. See ["The EC auto curve"](#the-ec-auto-curve-offsets-0x280x2b) for the curve model; in short: `duty/255 = start_pwm + (T − start_temp) × slope`, jumping to 255 at `full_temp`. A `full_temp` above 100 is unreachable (the EC temperature saturates at 100 °C) and turns that jump into a cap on the curve — **but the jump is also the firmware's only thermal-emergency path, so you get the cap or the emergency full-speed net, never both.** The reference tune below chooses the cap deliberately, leaving CPU self-throttling at Tjmax as the backstop.
+
+| Attribute | EC reg | Meaning |
+|---|---|---|
+| `curve_slope` | 0x28 | duty steps (/255) per °C — the raw multiplier, **not** the BIOS dropdown number |
+| `curve_start_pwm` | 0x29 | duty (/255) where the curve starts; minimum 26 (10 % floor for the engaged duty) |
+| `curve_start_temp` | 0x2A | °C where the fan engages (hysteresis: off again below this −5); maximum 100 — the EC temperature saturates there |
+| `curve_full_temp` | 0x2B | °C for the jump to full speed; >100 = unreachable, caps the curve |
+| `curve_commit` | — | write `1` = validate + apply the four values above atomically; write `0` = re-read the live EC values into them; read = `1` while unapplied edits exist |
+
+Writes to the four value attributes are staged in the driver — nothing reaches the EC until `curve_commit`. The commit rejects (EINVAL, nothing written) any combination where `start_pwm + (min(full_temp, 101) − 1 − start_temp) × slope > 255`: the EC stores its duty target in one byte, so an overflowing curve wraps and the fan would *slow down* as the CPU heats up. It likewise rejects `curve_start_pwm` below 26 — a 10 % floor for the curve's *engaged* duty; the firmware still parks the fan at 0 below `curve_start_temp` − 5 by design — and `curve_start_temp` above 100 (unreachable — the fan would never start). A `curve_full_temp` at or below `curve_start_temp` (even 0) is allowed: the full-speed jump then dominates and the fan simply runs at 255 from `curve_full_temp` up — loud but safe.
+
+```bash
+# find this driver's hwmon directory (several hwmon devices exist)
+HW=$(dirname $(grep -l it5570_fan /sys/class/hwmon/hwmon*/name))
+
+# inspect the live EC curve
+echo 0 | sudo tee $HW/curve_commit
+grep . $HW/curve_slope $HW/curve_start_pwm $HW/curve_start_temp $HW/curve_full_temp
+
+# stage and apply a quiet curve (idle ~1000 RPM, all-core ~2150 RPM)
+echo 2   | sudo tee $HW/curve_slope
+echo 60  | sudo tee $HW/curve_start_pwm
+echo 45  | sudo tee $HW/curve_start_temp
+echo 101 | sudo tee $HW/curve_full_temp
+echo 1   | sudo tee $HW/curve_commit
+```
+
+Rule of thumb for picking values: RPM ≈ 12 × duty255 + 74. The driver logs every applied curve and every rejected commit or parameter set to the kernel log: `sudo dmesg | grep it5570` or `journalctl -kb -g it5570`. Note that `sensors` won't list the `curve_*` attributes — libsensors only knows standard hwmon names — so read them from sysfs as above.
+
+**Persisting across reboots:** the BIOS rewrites the curve registers at every boot. `make dkms-install` puts a commented template at `/etc/modprobe.d/it5570_fan-curve.conf`; uncomment its `options` line (all four values required) and the driver re-applies your curve on every module load:
+
+```
+options it5570_fan curve_slope=2 curve_start_pwm=60 curve_start_temp=45 curve_full_temp=101
+```
+
+Note: modprobe.d only affects `modprobe` and the boot-time autoload — `make insmod` bypasses it.
+
 ### Thermal safety
 
 Manual mode (`pwm1_enable=1`) hands duty control to the host, and the EC applies **no thermal override underneath it** — this has now been established by disassembly. The mode dispatch at 0xA7F5 enters the curve block only when 0x23 = 2, so in manual mode the `T >= [0x2B]` forced-full-speed branch never executes. That branch is the firmware's *only* thermal-emergency path, and there is no fan-stall or fan-failure handling anywhere either: if the tachometer reads zero the firmware publishes 0 RPM and nothing reacts.
@@ -228,6 +268,8 @@ This section describes how the upstream project found *its* register map — the
 | `temp1_input` / `temp1_label` | CPU temperature (label: `CPU`) |
 | `pwm1` | Fan duty, scaled 0–255 from the EC's native 0–100 % (`pwm1 = round(EC% * 255 / 100)`). While `pwm1_enable=2` (auto), reports the *last commanded* manual duty rather than the EC auto curve's live output — the EC exposes no readback of what the curve is currently doing. |
 | `pwm1_enable` | `0` = full speed (EC mode 3) · `1` = manual (EC mode 1) · `2` = EC automatic curve (EC mode 2, default) |
+| `curve_slope` / `curve_start_pwm` / `curve_start_temp` / `curve_full_temp` | Staged EC auto-curve parameters (EC 0x28–0x2B) — see [Tuning the auto curve](#tuning-the-auto-curve) |
+| `curve_commit` | Write `1` = validate + apply the staged curve, `0` = re-read it from the EC; reads back `1` while staged ≠ applied |
 
 **10 % manual-duty floor:** the driver clamps every manual-mode duty write to a 10–100 % range — deliberately deviating from the hwmon convention that `pwm1 = 0` means "fan off". Writing `pwm1 = 0` does **not** stop the fan: it lands at the 10 % floor like every other value below 26, so `pwm1` values 0–25 are accepted but round-trip up to 26 on readback (`round(10% * 255 / 100) = 26`). Consequences for tooling: a fan-curve app with a 0 % point keeps the fan spinning at 10 % duty there, and `pwmconfig` will find the fan never fully stops and record `MINPWM` around 26 instead of 0 — that's the floor working as intended, not a bug.
 
