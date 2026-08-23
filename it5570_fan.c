@@ -127,6 +127,26 @@ static const u8 it5570_curve_regs[EC_CURVE_NREGS] = {
 	EC_REG_CURVE_START_TEMP, EC_REG_CURVE_FULL_TEMP,
 };
 
+/*
+ * Optional boot-time curve, normally set in
+ * /etc/modprobe.d/it5570_fan-curve.conf. Negative = unset; ignored with
+ * a warning unless all four are set and pass it5570_curve_check().
+ * Not runtime-writable (perm 0): the sysfs curve_* attributes are the
+ * runtime interface.
+ */
+static int curve_slope = -1;
+module_param(curve_slope, int, 0);
+MODULE_PARM_DESC(curve_slope, "EC auto-curve slope: duty steps (/255) per °C, 0-255 (all four curve_* parameters must be set together)");
+static int curve_start_pwm = -1;
+module_param(curve_start_pwm, int, 0);
+MODULE_PARM_DESC(curve_start_pwm, "EC auto-curve duty (/255) at curve_start_temp, 26-255");
+static int curve_start_temp = -1;
+module_param(curve_start_temp, int, 0);
+MODULE_PARM_DESC(curve_start_temp, "EC auto-curve start temperature in °C, 0-255");
+static int curve_full_temp = -1;
+module_param(curve_full_temp, int, 0);
+MODULE_PARM_DESC(curve_full_temp, "temperature in °C where the EC jumps to full speed; >100 disables the jump and caps the curve, 0-255");
+
 struct it5570_data {
 	struct mutex lock;	/* guards cached fields and cache->EC-write ordering */
 	unsigned long last_updated;
@@ -548,6 +568,64 @@ static int it5570_curve_apply(struct it5570_data *data, const u8 *curve)
 }
 
 /*
+ * Apply the modprobe.d curve at probe/boot. All-or-nothing: partial or
+ * invalid parameter sets are ignored with a warning naming the reason,
+ * and probe still succeeds. Requires data->lock.
+ */
+static const char *const it5570_curve_param_names[EC_CURVE_NREGS] = {
+	"curve_slope", "curve_start_pwm", "curve_start_temp",
+	"curve_full_temp",
+};
+
+static void it5570_apply_param_curve(struct it5570_data *data)
+{
+	const int params[EC_CURVE_NREGS] = { curve_slope, curve_start_pwm,
+					     curve_start_temp,
+					     curve_full_temp };
+	u8 curve[EC_CURVE_NREGS];
+	int i, nset = 0;
+
+	lockdep_assert_held(&data->lock);
+
+	for (i = 0; i < EC_CURVE_NREGS; i++)
+		if (params[i] >= 0)
+			nset++;
+	if (nset == 0)
+		return;
+	if (nset < EC_CURVE_NREGS) {
+		pr_warn(DRIVER_NAME ": ignoring fan-curve parameters: not set:%s%s%s%s\n",
+			params[CURVE_SLOPE] < 0 ? " curve_slope" : "",
+			params[CURVE_START_PWM] < 0 ? " curve_start_pwm" : "",
+			params[CURVE_START_TEMP] < 0 ? " curve_start_temp" : "",
+			params[CURVE_FULL_TEMP] < 0 ? " curve_full_temp" : "");
+		return;
+	}
+	for (i = 0; i < EC_CURVE_NREGS; i++) {
+		if (params[i] > 255) {
+			pr_warn(DRIVER_NAME ": ignoring fan-curve parameters: %s=%d out of range 0-255\n",
+				it5570_curve_param_names[i], params[i]);
+			return;
+		}
+		curve[i] = params[i];
+	}
+	if (!it5570_curve_check(curve, "module parameters"))
+		return;
+	/*
+	 * Need a known-good curve to roll back to - never write blind.
+	 * Retry the read once (mirrors the sysfs commit path) in case the
+	 * probe-time snapshot hit a transient EC timeout.
+	 */
+	if (!data->curve_valid && it5570_curve_refresh(data, false)) {
+		pr_warn(DRIVER_NAME ": ignoring fan-curve parameters: EC curve read failed\n");
+		return;
+	}
+	if (it5570_curve_apply(data, curve) == 0) {
+		memcpy(data->curve_staged, curve, EC_CURVE_NREGS);
+		data->curve_written = 0;
+	}
+}
+
+/*
  * Sysfs curve interface: the four value attrs read/write a staged
  * buffer only; curve_commit=1 validates and applies the whole 4-tuple
  * atomically, curve_commit=0 re-reads the EC (race-free live view,
@@ -924,6 +1002,16 @@ static int it5570_probe(struct platform_device *pdev)
 	if (ret)
 		dev_warn(&pdev->dev, "initial EC read failed (%d)\n", ret);
 
+	/*
+	 * hwmon sysfs is already live: a staged curve_* write landing in
+	 * this window is overwritten by a successful param apply, which
+	 * syncs curve_staged to the applied curve. Acceptable - the params
+	 * are the boot-time intent.
+	 */
+	mutex_lock(&data->lock);
+	it5570_apply_param_curve(data);
+	mutex_unlock(&data->lock);
+
 	return 0;
 }
 
@@ -977,18 +1065,34 @@ static int it5570_resume(struct device *dev)
 {
 	struct it5570_data *data = dev_get_drvdata(dev);
 	int ret = 0;
+	int curve_ret = 0;
 
 	mutex_lock(&data->lock);
 	if (data->fan_mode == EC_FAN_MODE_MANUAL)
 		ret = it5570_set_manual(data, data->fan_duty);
 	else if (data->fan_mode == EC_FAN_MODE_FULL)
 		ret = it5570_set_mode(data, EC_FAN_MODE_FULL);
+	/*
+	 * The BIOS rewrites the curve at boot; whether S3 exit does too is
+	 * unproven, so re-apply the last curve known to be in the EC (the
+	 * modprobe.d one unless live-tuned since). Skipped if no curve was
+	 * ever successfully read or applied.
+	 */
+	if (data->curve_valid) {
+		u8 curve[EC_CURVE_NREGS];
+
+		memcpy(curve, data->curve_ec, sizeof(curve));
+		curve_ret = it5570_curve_apply(data, curve);
+	}
 	/* jiffies froze across suspend; force a fresh read next access */
 	data->valid = false;
 	mutex_unlock(&data->lock);
 	if (ret)
 		dev_warn(dev, "failed to restore fan state on resume (%d)\n",
 			 ret);
+	if (curve_ret)
+		dev_warn(dev, "failed to restore fan curve on resume (%d)\n",
+			 curve_ret);
 	return 0;
 }
 
