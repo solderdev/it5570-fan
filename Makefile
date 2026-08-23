@@ -47,6 +47,7 @@ rmmod: ## unload the module
 DKMS_NAME := it5570-fan
 DKMS_VER   = $(shell { git describe --tags --abbrev=0 2>/dev/null || echo "v0.1.0"; } | sed 's/^v//')
 DKMS_SRC   = /usr/src/$(DKMS_NAME)-$(DKMS_VER)
+CURVE_CONF := /etc/modprobe.d/$(MOD)-curve.conf
 
 dkms-install: ## register with DKMS, install module and autoload config
 	sudo mkdir -p $(DKMS_SRC)
@@ -56,10 +57,24 @@ dkms-install: ## register with DKMS, install module and autoload config
 	sudo dkms build $(DKMS_NAME)/$(DKMS_VER)
 	sudo dkms install $(DKMS_NAME)/$(DKMS_VER)
 	sudo install -Dm644 $(MOD).conf /etc/modules-load.d/$(MOD).conf
+	@if [ -e $(CURVE_CONF) ]; then \
+		echo "Kept existing $(CURVE_CONF)"; \
+	else \
+		sudo install -Dm644 $(MOD)-curve.conf $(CURVE_CONF); \
+	fi
+	@echo "Edit $(CURVE_CONF) to persist a fan curve (uncomment its options line)."
 
 dkms-remove: ## remove the module from DKMS and delete autoload config
 	sudo dkms remove $(DKMS_NAME)/$(DKMS_VER) --all
 	sudo rm -rf $(DKMS_SRC)
 	sudo rm -f /etc/modules-load.d/$(MOD).conf
+	@# cmp also keeps an unmodified copy of an OLDER template revision -
+	@# acceptable: never delete a file we cannot prove we'd recreate.
+	@if cmp -s $(MOD)-curve.conf $(CURVE_CONF); then \
+		sudo rm -f $(CURVE_CONF); \
+		echo "Removed $(CURVE_CONF)"; \
+	elif [ -e $(CURVE_CONF) ]; then \
+		echo "Kept $(CURVE_CONF) (modified - your curve settings survive)"; \
+	fi
 
 .PHONY: help all clean insmod rmmod dkms-install dkms-remove
