@@ -145,6 +145,12 @@ Rule of thumb for picking values: RPM ≈ 12 × duty255 + 74. The driver logs ev
 options it5570_fan curve_slope=2 curve_start_pwm=60 curve_start_temp=45 curve_full_temp=101
 ```
 
+Apply new config values with:
+
+```
+sudo modprobe -r it5570_fan && sudo modprobe it5570_fan
+```
+
 Note: modprobe.d only affects `modprobe` and the boot-time autoload — `make insmod` bypasses it.
 
 ### Thermal safety
