@@ -54,7 +54,7 @@ You may also have found this page by searching for:
 
 | Device | APU | EC firmware | Status |
 |---|---|---|---|
-| LattePanda Sigma | Intel Core i5-1340P (Alder Lake-P) | ITE EC-V14.6, `LP-EC-WTADLC1R210-V1.02` | Tested live end-to-end on kernel 6.12: load, manual duty, 10 % floor clamp, full speed, auto restore, unload, suspend/resume — see [Verification results](#verification-results) |
+| LattePanda Sigma | Intel Core i5-1340P (Alder Lake-P) | ITE EC-V14.6, `LP-EC-WTADLC1R210-V1.02` | Tested live end-to-end on kernel 6.12: load, manual duty, 10 % floor clamp, full speed, auto restore, unload, suspend/resume, auto-curve tuning and boot persistence (modprobe.d) — see [Verification results](#verification-results) |
 
 ## Installation
 
