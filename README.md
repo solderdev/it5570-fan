@@ -2,18 +2,20 @@
 
 Linux hwmon kernel module for the ITE IT5570 embedded controller on the **LattePanda Sigma**, providing fan monitoring and control where there is no native Linux driver.
 
-This fork is **LattePanda Sigma-only**: the probe is gated on a DMI match (`LattePanda` / `LattePanda Sigma`) and refuses to bind on anything else. The upstream project this was forked from targets white-label AMD mini PCs (AceMagic, Beelink, MinisForum, ...) that happen to carry the same IT5570 chip ID but run completely different EC firmware with an incompatible register layout — this driver's constants would silently do the wrong thing there. If you have one of those AMD-based mini PCs, use the [upstream project](https://github.com/passiveEndeavour/it5570-fan) instead.
+This fork is **LattePanda Sigma-only**: the probe is gated on a DMI match (`LattePanda` / `LattePanda Sigma`) and refuses to bind on anything else. The upstream project this was forked from targets white-label AMD mini PCs that happen to carry the same IT5570 chip ID but run completely different EC firmware with an incompatible register layout — this driver's constants would silently do the wrong thing there. If you have one of those AMD-based mini PCs, use the [upstream project](https://github.com/passiveEndeavour/it5570-fan) instead.
+
+The numbers below are used with a 92mm Arctic P9 PWM fan (modded from the original fan).
 
 ## Features
 
-- Fan RPM monitoring (one fan)
+- CPU fan RPM monitoring
 - PWM fan speed control — manual duty, full speed, and the EC's automatic curve
 - One CPU temperature sensor
 - Standard hwmon sysfs interface, usable by any fan-control tool
 - DKMS support — auto-rebuilds on kernel updates
 - Restores automatic EC fan control on module unload, and hands control back to the EC across suspend/resume
 
-### sensors output
+### sensors command output
 
 Live capture on a LattePanda Sigma, EC auto mode at idle:
 
@@ -21,7 +23,7 @@ Live capture on a LattePanda Sigma, EC auto mode at idle:
 it5570_fan-isa-0000
 Adapter: ISA adapter
 fan1:        2061 RPM
-CPU:          +48.0 C  
+CPU:          +48.0 C
 pwm1:             64%
 ```
 
@@ -31,7 +33,7 @@ The `64%` above is an lm-sensors display quirk, not the duty: `sensors` 3.6.2 pr
 
 ## Is this driver for me?
 
-If you ran `sensors-detect` and got this message:
+If you ran `sensors-detect` on a Lattepanda Sigma and got this message:
 
 ```
 Probing for Super-I/O at 0x4e/0x4f
@@ -52,9 +54,9 @@ You may also have found this page by searching for:
 
 ## Tested Hardware
 
-| Device | APU | EC firmware | Status |
+| Device | Fan | EC firmware | Status |
 |---|---|---|---|
-| LattePanda Sigma | Intel Core i5-1340P (Alder Lake-P) | ITE EC-V14.6, `LP-EC-WTADLC1R210-V1.02` | Tested live end-to-end on kernel 6.12: load, manual duty, 10 % floor clamp, full speed, auto restore, unload, suspend/resume, auto-curve tuning, boot persistence (modprobe.d) and curve re-apply on resume — see [Verification results](#verification-results) |
+| LattePanda Sigma | Arctic P9 PWM CO | ITE EC-V14.6, `LP-EC-WTADLC1R210-V1.02` | Tested live end-to-end on kernel 6.12: load, manual duty, 10 % floor clamp, full speed, auto restore, unload, suspend/resume, auto-curve tuning, boot persistence (modprobe.d) and curve re-apply on resume — see [Verification results](#verification-results) |
 
 ## Installation
 
@@ -103,7 +105,9 @@ echo 2 | sudo tee /sys/class/hwmon/hwmon*/pwm1_enable
 
 ### Tuning the auto curve
 
-The EC's automatic curve (`pwm1_enable=2`, the default and recommended mode) is tunable through four driver attributes — the same four values as the BIOS fan setup, live and scriptable. See ["The EC auto curve"](#the-ec-auto-curve-offsets-0x280x2b) for the curve model; in short: `duty/255 = start_pwm + (T − start_temp) × slope`, jumping to 255 at `full_temp`. A `full_temp` above 100 is unreachable (the EC temperature saturates at 100 °C) and turns that jump into a cap on the curve — **but the jump is also the firmware's only thermal-emergency path, so you get the cap or the emergency full-speed net, never both.** The reference tune below chooses the cap deliberately, leaving CPU self-throttling at Tjmax as the backstop.
+The EC's automatic curve (`pwm1_enable=2`, the default and recommended mode) is tunable through four driver attributes — the same four values as the BIOS fan setup, live and scriptable. See ["The EC auto curve"](#the-ec-auto-curve-offsets-0x280x2b) for the curve model; in short: `duty/255 = start_pwm + (T − start_temp) × slope`, jumping to 255 at `full_temp`.
+
+A `full_temp` above 100 is unreachable (the EC temperature saturates at 100 °C) and turns that jump into a cap on the curve — **but the jump is also the firmware's only thermal-emergency path, so you get the cap or the emergency full-speed net, never both.** The reference tune below chooses the cap deliberately, leaving CPU self-throttling at Tjmax as the backstop.
 
 | Attribute | EC reg | Meaning |
 |---|---|---|
@@ -113,7 +117,9 @@ The EC's automatic curve (`pwm1_enable=2`, the default and recommended mode) is 
 | `curve_full_temp` | 0x2B | °C for the jump to full speed; >100 = unreachable, caps the curve |
 | `curve_commit` | — | write `1` = validate + apply the four values above atomically; write `0` = re-read the live EC values into them; read = `1` while unapplied edits exist |
 
-Writes to the four value attributes are staged in the driver — nothing reaches the EC until `curve_commit`. The commit rejects (EINVAL, nothing written) any combination where `start_pwm + (min(full_temp, 101) − 1 − start_temp) × slope > 255`: the EC stores its duty target in one byte, so an overflowing curve wraps and the fan would *slow down* as the CPU heats up. It likewise rejects `curve_start_pwm` below 26 — a 10 % floor for the curve's *engaged* duty; the firmware still parks the fan at 0 below `curve_start_temp` − 5 by design — and `curve_start_temp` above 100 (unreachable — the fan would never start). A `curve_full_temp` at or below `curve_start_temp` (even 0) is allowed: the full-speed jump then dominates and the fan simply runs at 255 from `curve_full_temp` up — loud but safe.
+Writes to the four value attributes are staged in the driver — nothing reaches the EC until `curve_commit`.
+
+The commit rejects (EINVAL, nothing written) any combination where `start_pwm + (min(full_temp, 101) − 1 − start_temp) × slope > 255`: the EC stores its duty target in one byte, so an overflowing curve wraps and the fan would *slow down* as the CPU heats up. It likewise rejects `curve_start_pwm` below 26 — a 10 % floor for the curve's *engaged* duty; the firmware still parks the fan at 0 below `curve_start_temp` − 5 by design — and `curve_start_temp` above 100 (unreachable — the fan would never start). A `curve_full_temp` at or below `curve_start_temp` (even 0) is allowed: the full-speed jump then dominates and the fan simply runs at 255 from `curve_full_temp` up — loud but safe.
 
 ```bash
 # find this driver's hwmon directory (several hwmon devices exist)
@@ -189,7 +195,7 @@ T <  [0x2A] - 5    ->  target = 0        # 5 °C hysteresis
 
 The target is in units of 1/255, then scaled by the PWM period register and written to the duty register. Notes for anyone tuning these bytes:
 
-- **0x28 is a multiplier, not a divisor**: duty steps out of 255 per °C. BIOS does not store the label shown (label 1 → byte 3, label 2 → byte 4 — consistent with the dropdown's list index, though only these two data points exist), and the firmware uses that byte raw, so the numbers in BIOS setup do not describe the resulting slope.
+- **0x28 is a multiplier**: duty steps out of 255 per °C. The firmware uses that byte raw, so the numbers in BIOS setup do not describe the resulting slope.
 - **0x29 is in 1/255 units, not percent** (unlike the manual-duty byte 0x2D).
 - The forced-full-speed branch at `T >= [0x2B]` bypasses the ramp limiter entirely. Since the temperature is capped at 100 °C, setting 0x2B above 100 disables that branch permanently rather than merely raising it.
 - Between targets the duty register moves by **±1 step per tick (~2 Hz)**, so a full 0→255 sweep takes ~125 s. From a standstill the firmware instead kicks the duty straight to 0x29.
@@ -281,7 +287,7 @@ If you have a LattePanda Sigma (or another LattePanda model carrying an ITE IT55
 - `sensors` output with the module loaded
 - Whether fan control works correctly
 
-If you have one of the AMD-based mini PCs instead, test and report against the [upstream project](https://github.com/passiveEndeavour/it5570-fan) — this fork won't bind on your hardware.
+If you have one of the AMD-based mini PCs instead, test and report against the [upstream project](https://github.com/passiveEndeavour/it5570-fan) — this fork is not for your hardware.
 
 ## License
 
