@@ -142,7 +142,7 @@ module_param(curve_start_pwm, int, 0);
 MODULE_PARM_DESC(curve_start_pwm, "EC auto-curve duty (/255) at curve_start_temp, 26-255");
 static int curve_start_temp = -1;
 module_param(curve_start_temp, int, 0);
-MODULE_PARM_DESC(curve_start_temp, "EC auto-curve start temperature in °C, 0-255");
+MODULE_PARM_DESC(curve_start_temp, "EC auto-curve start temperature in °C, 0-100");
 static int curve_full_temp = -1;
 module_param(curve_full_temp, int, 0);
 MODULE_PARM_DESC(curve_full_temp, "temperature in °C where the EC jumps to full speed; >100 disables the jump and caps the curve, 0-255");
